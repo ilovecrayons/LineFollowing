@@ -20,9 +20,9 @@ IMAGE_HEIGHT = 960
 IMAGE_WIDTH = 1280
 CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2]) # Center of the image frame. We will treat this as the center of mass of the drone
 EXTEND = 300 # Number of pixels forward to extrapolate the line
-KP_X = None
-KP_Y = None
-KP_Z_W = None # Proportional gains for x, y, and angular velocity control
+KP_X = 1
+KP_Y = 1
+KP_Z_W = 1 # Proportional gains for x, y, and angular velocity control
 DISPLAY = True
 
 #########################
@@ -93,11 +93,28 @@ class CoordTransforms():
                                   'R_fc2fc'
                                   }
        
+        # Define the transformation matrix from downward camera to body down frame
         self.R_dc2bd = np.array([
             [0.0, -1.0, 0.0, 0.0], # bd.x = -dc.y
             [1.0, 0.0, 0.0, 0.0],  # bd.y = dc.x
             [0.0, 0.0, 1.0, 0.0],  # bd.z = dc.z
-            [0.0, 0.0, 0.0, 0.0]
+            [0.0, 0.0, 0.0, 1.0]   # Fix: Last element should be 1.0, not 0.0
+        ])
+        
+        # Define the identity matrices for same-frame transformations
+        self.R_lenu2lenu = np.eye(4)
+        self.R_lned2lned = np.eye(4) 
+        self.R_bu2bu = np.eye(4)
+        self.R_bd2bd = np.eye(4)
+        self.R_dc2dc = np.eye(4)
+        self.R_fc2fc = np.eye(4)
+        
+        # Define the transformation matrix from body down to downward camera frame
+        self.R_bd2dc = np.array([
+            [0.0, 1.0, 0.0, 0.0],  # dc.x = bd.y
+            [-1.0, 0.0, 0.0, 0.0], # dc.y = -bd.x
+            [0.0, 0.0, 1.0, 0.0],  # dc.z = bd.z
+            [0.0, 0.0, 0.0, 1.0]   # Fix: Last element should be 1.0, not 0.0
         ])
     
     
@@ -305,41 +322,68 @@ class LineController(Node):
             Args:
                 - param: parameters that define the center and direction of detected line
         """
-        print("Following line")
+        self.get_logger().info("Line detected, following line")
         # Extract line parameters
         x, y, vx, vy = param.x, param.y, param.vx, param.vy
-        line_point = np.array([x, y])
-        line_dir = np.array([vx, vy])
-        line_dir = line_dir / np.linalg.norm(line_dir)  # Ensure unit vector
-
-        # Target point EXTEND pixels ahead along the line direction
-        target = line_point + EXTEND * line_dir
-
-        # Error between center and target
-        error = target - CENTER
-
-        # Set linear velocities (downward camera frame)
-        self.vx__dc = KP_X * error[0]
-        self.vy__dc = KP_Y * error[1]
-
-        # Get angle between y-axis and line direction
-        forward = np.array([0.0, 1.0])
-        angle = math.atan2(line_dir[1], line_dir[0])
-        angle_error = math.atan2(forward[1], forward[0]) - angle
-
-        # Set angular velocity (yaw)
-        self.wz__dc = KP_Z_W * angle_error
-        self.publish_trajectory_setpoint(*self.convert_velocity_setpoints())
-
-        """
-        TODO: Implement logic to set a target on the line given a point and tangent vector.
-        TODO: Find the error between the target and the center of the image.
-        TODO: Set linear velocity in the downward camera frame (self.vx__dc, self.vy__dc) based on the error. (hint: use KP_X and KP_Y)
-        TODO: Find the error between the forward direction of the drone and the line direction.
-        TODO: Set angular velocity in the downward camera frame (self.wz__dc) based on the error. (hint: use KP_Z_W)
-        TODO: Convert downward camera frame velocities to body down frame velocities (use self.convert_velocity_setpoints())
-        TODO: Publish the trajectory setpoint with the converted velocities (use self.publish_trajectory_setpoint)
-        """
+        
+        # Normalize direction vector to ensure it's a unit vector
+        norm = np.sqrt(vx**2 + vy**2)
+        if norm > 0:
+            vx /= norm
+            vy /= norm
+            
+        # Target point is EXTEND pixels ahead along the line
+        target_x = x + EXTEND * vx
+        target_y = y + EXTEND * vy
+        
+        # Calculate error between target and center of image
+        error_x = target_x - CENTER[0]
+        error_y = target_y - CENTER[1]
+        
+        # In the downward camera frame:
+        # X increases to the right in the image
+        # Y increases downward in the image
+        
+        # For a line pointing down (positive vy), we want to go forward (negative y in dc frame)
+        # For a line offset to the right (positive error_x), we need to move left (negative x in dc frame)
+        
+        # Set proportional control for position
+        self.vx__dc = -KP_X * error_x / 100.0  # Unchanged: negative because right in image means left movement
+        
+        # The important part: make the drone prioritize moving along the line
+        # The primary direction of travel should be determined by the line direction
+        primary_direction = -vy  # Negative because down in image (positive vy) means forward
+        self.vy__dc = KP_Y * primary_direction * _MAX_SPEED / 2.0  # Prioritize moving along the line
+        
+        # Add a correctional component based on y-error, but with lower weight
+        self.vy__dc += -KP_Y * error_y / 200.0  # Reduced weight for lateral correction
+        
+        # Calculate angle for heading control
+        # We want to align drone's forward direction with the line direction
+        desired_heading = np.arctan2(vy, vx)  # Direction of the line in image
+        # In dc frame, forward is along negative y-axis
+        current_heading = np.arctan2(1.0, 0.0)  # Default forward direction
+        angular_error = self.normalize_angle(desired_heading - current_heading)
+        
+        # Set angular velocity for heading correction
+        self.wz__dc = KP_Z_W * angular_error / 5.0  # Scale down to avoid oscillation
+        
+        # Debug info
+        self.get_logger().info(f"Line at ({x:.1f}, {y:.1f}), direction ({vx:.2f}, {vy:.2f})")
+        self.get_logger().info(f"Target at ({target_x:.1f}, {target_y:.1f}), errors ({error_x:.1f}, {error_y:.1f})")
+        self.get_logger().info(f"Controls: vx={self.vx__dc:.2f}, vy={self.vy__dc:.2f}, wz={self.wz__dc:.2f}")
+        
+        # Convert and publish velocity commands
+        vx_bd, vy_bd, wz_bd = self.convert_velocity_setpoints()
+        self.publish_trajectory_setpoint(vx_bd, vy_bd, wz_bd)
+    
+    def normalize_angle(self, angle):
+        """Normalize angle to be between -pi and pi"""
+        while angle > np.pi:
+            angle -= 2 * np.pi
+        while angle < -np.pi:
+            angle += 2 * np.pi
+        return angle
 
 def main(args=None) -> None:
     print('Starting offboard control node...')
