@@ -24,7 +24,7 @@ LENGTH_THRESH = None  # If the length of the largest contour is less than LENGTH
 KERNEL = np.ones((5, 5), np.uint8)
 DISPLAY = True
 # Define FOV reduction factor (0.5 = 50% reduction)
-FOV_REDUCTION = 0.5
+FOV_REDUCTION = 0.6
 
 class LineDetector(Node):
     def __init__(self):
@@ -58,6 +58,10 @@ class LineDetector(Node):
         self.original_width = None
         self.original_height = None
         self.original_center = None
+        
+        # Direction consistency tracking
+        self.previous_direction = None  # Store previous direction vector (vx, vy)
+        self.detection_count = 0       # Count of successful detections for startup handling
 
     def crop_center(self, img, crop_factor=FOV_REDUCTION):
         """
@@ -93,6 +97,63 @@ class LineDetector(Node):
         
         return cropped_img
 
+    def calculate_angular_distance(self, v1, v2):
+        """
+        Calculate the angular distance between two 2D vectors.
+        Args:
+            v1, v2: Tuples representing 2D vectors (vx, vy)
+        Returns:
+            Angular distance in radians (0 to pi)
+        """
+        # Calculate dot product
+        dot_product = v1[0] * v2[0] + v1[1] * v2[1]
+        
+        # Calculate magnitudes
+        mag1 = np.sqrt(v1[0]**2 + v1[1]**2)
+        mag2 = np.sqrt(v2[0]**2 + v2[1]**2)
+        
+        # Avoid division by zero
+        if mag1 == 0 or mag2 == 0:
+            return np.pi  # Maximum distance if one vector is zero
+        
+        # Calculate cosine of angle
+        cos_angle = np.clip(dot_product / (mag1 * mag2), -1.0, 1.0)
+        
+        # Return angle in radians (0 to pi)
+        # Remove abs() to properly distinguish between same and opposite directions
+        return np.arccos(cos_angle)
+
+    def choose_consistent_direction(self, vx, vy):
+        """
+        Choose the direction vector that maintains consistency with previous movement.
+        A line can point in two directions, so we pick the one closest to previous direction.
+        Args:
+            vx, vy: Current direction vector components
+        Returns:
+            (vx, vy) tuple with consistent direction
+        """
+        # For the first few detections or if no previous direction, use downward preference
+        if self.previous_direction is None or self.detection_count < 3:
+            # Default behavior: prefer downward direction in image
+            if vy < 0:
+                return (-vx, -vy)
+            return (vx, vy)
+        
+        # Calculate angular distances for both possible directions
+        direction1 = (vx, vy)
+        direction2 = (-vx, -vy)
+        
+        dist1 = self.calculate_angular_distance(direction1, self.previous_direction)
+        dist2 = self.calculate_angular_distance(direction2, self.previous_direction)
+        
+        # Choose the direction with smaller angular distance
+        if dist1 <= dist2:
+            self.get_logger().info(f"Chose direction1: angular dist = {dist1:.3f} vs {dist2:.3f}")
+            return direction1
+        else:
+            self.get_logger().info(f"Chose direction2: angular dist = {dist2:.3f} vs {dist1:.3f}")
+            return direction2
+
     ######################
     # CALLBACK FUNCTIONS #
     ######################
@@ -115,9 +176,16 @@ class LineDetector(Node):
         if line is None:
             self.no_detection_count += 1
             if self.no_detection_count > self.max_no_detection:
-                # Use default line (center of cropped image, pointing down)
+                # Use default line (center of cropped image) with consistent direction
                 self.get_logger().warn("Using default line after multiple detection failures")
-                line = (cropped_image.shape[1]/2, cropped_image.shape[0]/2, 0.0, 1.0)
+                default_vx, default_vy = 0.0, 1.0  # Default downward direction
+                
+                # Apply direction consistency if we have previous direction
+                if self.previous_direction is not None and self.detection_count >= 3:
+                    default_vx, default_vy = self.choose_consistent_direction(default_vx, default_vy)
+                    self.previous_direction = (default_vx, default_vy)
+                
+                line = (cropped_image.shape[1]/2, cropped_image.shape[0]/2, default_vx, default_vy)
         else:
             # Reset counter when line is detected
             self.no_detection_count = 0
@@ -183,31 +251,42 @@ class LineDetector(Node):
             self.get_logger().warn("Invalid line information received from line processor")
             return None
             
-        # Extract values from line_info
+        # Extract values from line_info - now with enhanced curve support
         x0 = line_info['x_position']
+        y0 = line_info.get('y_position', image.shape[0] / 2)  # Use provided y or default to center
         m = line_info['slope']
         b = line_info['intercept']
         vertical = line_info['is_vertical']
         
-        # Calculate the direction vector (vx, vy) based on line properties
-        if vertical:
-            # For a vertical line, direction is straight down (0, 1)
+        # Check if we have direct direction vectors from curve fitting
+        if 'direction_x' in line_info and 'direction_y' in line_info:
+            # Use the direction vectors directly from the curve fitting
+            vx = line_info['direction_x']
+            vy = line_info['direction_y']
             x = x0
-            y = image.shape[0] / 2
-            vx = 0.0
-            vy = 1.0  # Point down in the image
+            y = y0
+            
+            self.get_logger().info(f"Using curve-fitted direction: vx={vx:.3f}, vy={vy:.3f}")
         else:
-            # For a non-vertical line, calculate direction using slope
-            x = image.shape[1] / 2  # Center x position
-            y = m * x + b          # Corresponding y position
-            
-            # Get a point further along the line (in positive x direction)
-            x2 = x + 100
-            y2 = m * x2 + b
-            
-            # Direction vector from (x,y) to (x2,y2)
-            vx = x2 - x
-            vy = y2 - y
+            # Fallback to traditional slope-based calculation
+            if vertical:
+                # For a vertical line, direction is straight down (0, 1)
+                x = x0
+                y = image.shape[0] / 2
+                vx = 0.0
+                vy = 1.0  # Point down in the image
+            else:
+                # For a non-vertical line, calculate direction using slope
+                x = image.shape[1] / 2  # Center x position
+                y = m * x + b          # Corresponding y position
+                
+                # Get a point further along the line (in positive x direction)
+                x2 = x + 100
+                y2 = m * x2 + b
+                
+                # Direction vector from (x,y) to (x2,y2)
+                vx = x2 - x
+                vy = y2 - y
         
         # Check if any of the line parameters are NaN
         if (np.isnan(x) or np.isnan(y) or np.isnan(vx) or np.isnan(vy)):
@@ -220,13 +299,14 @@ class LineDetector(Node):
             vx /= norm
             vy /= norm
         
-        # Make sure the vector points downward in the image (positive y)
-        # This ensures consistent line following direction
-        if vy < 0:
-            vx = -vx
-            vy = -vy
+        # Choose direction that maintains consistency with previous movement
+        vx, vy = self.choose_consistent_direction(vx, vy)
         
-        self.get_logger().info(f"Detected line: x={x}, y={y}, vx={vx}, vy={vy}")
+        # Store this direction for next iteration and increment detection count
+        self.previous_direction = (vx, vy)
+        self.detection_count += 1
+        
+        self.get_logger().info(f"Detected line: x={x}, y={y}, vx={vx}, vy={vy} (detection #{self.detection_count})")
         return (x, y, vx, vy)
 
 

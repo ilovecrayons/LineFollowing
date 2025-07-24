@@ -16,13 +16,13 @@ _RATE = 10 # (Hz) rate for rospy.rate
 _MAX_SPEED = 1.5 # (m/s)
 _MAX_CLIMB_RATE = 1.0 # m/s
 _MAX_ROTATION_RATE = 5.0 # rad/s 
-IMAGE_HEIGHT = 960
-IMAGE_WIDTH = 1280
+IMAGE_HEIGHT = 576  # Updated to match actual cropped image dimensions
+IMAGE_WIDTH = 768   # Updated to match actual cropped image dimensions
 CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2]) # Center of the image frame. We will treat this as the center of mass of the drone
 EXTEND = 300 # Number of pixels forward to extrapolate the line
-KP_X = 1
-KP_Y = 1
-KP_Z_W = 1 # Proportional gains for x, y, and angular velocity control
+KP_X = 1    # Increased for more responsive lateral control
+KP_Y = 1    # Increased for more responsive forward/backward control
+KP_Z_W = 2.0  # Reduced to prevent oscillation
 DISPLAY = True
 
 #########################
@@ -286,11 +286,16 @@ class LineController(Node):
         self.vehicle_command_publisher.publish(msg)
 
     def convert_velocity_setpoints(self):
+        # Debug input values
+        self.get_logger().info(f"Converting DC velocities: vx={self.vx__dc:.3f}, vy={self.vy__dc:.3f}, wz={self.wz__dc:.3f}")
+        
         # Set linear velocity (convert command velocity from downward camera frame to bd frame)
         vx, vy, vz = self.coord_transforms.static_transform((self.vx__dc, self.vy__dc, self.vz__dc), 'dc', 'bd')
 
         # Set angular velocity (convert command angular velocity from downward camera to bd frame)
         _, _, wz = self.coord_transforms.static_transform((0.0, 0.0, self.wz__dc), 'dc', 'bd')
+
+        self.get_logger().info(f"After coordinate transform: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
 
         # enforce safe velocity limits
         if _MAX_SPEED < 0.0 or _MAX_CLIMB_RATE < 0.0 or _MAX_ROTATION_RATE < 0.0:
@@ -299,6 +304,7 @@ class LineController(Node):
         vy = min(max(vy,-_MAX_SPEED), _MAX_SPEED)
         wz = min(max(wz,-_MAX_ROTATION_RATE), _MAX_ROTATION_RATE)
 
+        self.get_logger().info(f"After velocity limits: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
         return (vx, vy, wz)
     
     def timer_callback(self) -> None:
@@ -340,41 +346,30 @@ class LineController(Node):
         error_x = target_x - CENTER[0]
         error_y = target_y - CENTER[1]
         
-        # In the downward camera frame:
-        # X increases to the right in the image
-        # Y increases downward in the image
-        
-        # For a line pointing down (positive vy), we want to go forward (negative y in dc frame)
-        # For a line offset to the right (positive error_x), we need to move left (negative x in dc frame)
-        
-        # Set proportional control for position
-        self.vx__dc = -KP_X * error_x / 100.0  # Unchanged: negative because right in image means left movement
-        
-        # The important part: make the drone prioritize moving along the line
-        # The primary direction of travel should be determined by the line direction
-        primary_direction = -vy  # Negative because down in image (positive vy) means forward
-        self.vy__dc = KP_Y * primary_direction * _MAX_SPEED / 2.0  # Prioritize moving along the line
-        
-        # Add a correctional component based on y-error, but with lower weight
-        self.vy__dc += -KP_Y * error_y / 200.0  # Reduced weight for lateral correction
-        
-        # Calculate angle for heading control
-        # We want to align drone's forward direction with the line direction
-        desired_heading = np.arctan2(vy, vx)  # Direction of the line in image
-        # In dc frame, forward is along negative y-axis
-        current_heading = np.arctan2(1.0, 0.0)  # Default forward direction
-        angular_error = self.normalize_angle(desired_heading - current_heading)
-        
-        # Set angular velocity for heading correction
-        self.wz__dc = KP_Z_W * angular_error / 5.0  # Scale down to avoid oscillation
-        
-        # Debug info
+        # Debug info - show what we received
         self.get_logger().info(f"Line at ({x:.1f}, {y:.1f}), direction ({vx:.2f}, {vy:.2f})")
         self.get_logger().info(f"Target at ({target_x:.1f}, {target_y:.1f}), errors ({error_x:.1f}, {error_y:.1f})")
-        self.get_logger().info(f"Controls: vx={self.vx__dc:.2f}, vy={self.vy__dc:.2f}, wz={self.wz__dc:.2f}")
+        
+        # SIMPLIFIED CONTROL LOGIC - direct proportional control
+        # For lateral control: error_x directly controls lateral movement
+        self.vx__dc = KP_X * error_x / 100.0  # Right/left movement based on target position
+        
+        # For forward movement: always move forward, adjust based on y error
+        base_forward_speed = 0.5  # Constant forward movement
+        y_correction = -KP_Y * error_y / 200.0  # Adjust forward speed based on line position
+        self.vy__dc = -(base_forward_speed + y_correction)  # Negative for forward in dc frame
+        
+        # For heading control: align with line direction
+        desired_heading = np.arctan2(vx, -vy)  # Calculate desired heading from line direction
+        angular_error = self.normalize_angle(desired_heading)
+        self.wz__dc = KP_Z_W * angular_error / 10.0  # Reduce oscillation
+        
+        # Debug control outputs before coordinate transformation
+        self.get_logger().info(f"DC frame commands: vx={self.vx__dc:.3f}, vy={self.vy__dc:.3f}, wz={self.wz__dc:.3f}")
         
         # Convert and publish velocity commands
         vx_bd, vy_bd, wz_bd = self.convert_velocity_setpoints()
+        self.get_logger().info(f"BD frame commands: vx={vx_bd:.3f}, vy={vy_bd:.3f}, wz={wz_bd:.3f}")
         self.publish_trajectory_setpoint(vx_bd, vy_bd, wz_bd)
     
     def normalize_angle(self, angle):

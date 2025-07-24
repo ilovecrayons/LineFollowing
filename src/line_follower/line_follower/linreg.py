@@ -1,270 +1,264 @@
-from __future__ import print_function
-import matplotlib.pyplot as plt
-import numpy as np
+import rclpy
+from rclpy.node import Node 
+from sensor_msgs.msg import Image
 import cv2
-import glob
-from matplotlib.lines import Line2D
-import time
+from cv_bridge import CvBridge 
+import numpy as np
 
-# Further reduce minimum area for more sensitive detection
-AREA_MIN      = 50  # Further reduced from 100 to 50
-AR_MIN        = 2.5    
-X_CLUSTER_PX  = 10       
-VERTICAL_DEG  = 75.0   
-VAR_RATIO     = 0.5      
-SLOPE_LIMIT = np.tan(np.deg2rad(VERTICAL_DEG))
+def detect_white_strict(img):
+    """Detect white pixels with strict thresholds"""
+    lower_white = np.array([250, 250, 250])
+    upper_white = np.array([255, 255, 255])
+    mask = cv2.inRange(img, lower_white, upper_white)
+    return mask, np.sum(mask > 0) > 100
 
+def detect_white_relaxed(img):
+    """Detect white pixels with relaxed thresholds"""
+    lower_white = np.array([200, 200, 200])
+    upper_white = np.array([255, 255, 255])
+    mask = cv2.inRange(img, lower_white, upper_white)
+    return mask, np.sum(mask > 0) > 100
 
-def calculate_regression(points, slope_limit=SLOPE_LIMIT, var_ratio=VAR_RATIO):
-    if points.shape[0] < 2:
-        return np.nan, np.nan, False, None
-    
-    x = points[:, 1].astype(np.float64)
-    y = points[:, 0].astype(np.float64)
-    
-    vx = x.var()
-    vy = y.var()
-    
-    if vy > 0 and vx < var_ratio * vy:
-        return np.nan, np.nan, True, float(np.median(x))
-    
-    x_mean = x.mean()
-    y_mean = y.mean()
-    d = ((x - x_mean) ** 2).sum()
-    if d == 0:
-        return np.nan, np.nan, True, x_mean
-    
-    m = ((x - x_mean) * (y - y_mean)).sum() / d
-    b = y_mean - m * x_mean
-    
-    if abs(m) > slope_limit:
-        return np.nan, np.nan, True, float(np.median(x))
-    
-    return m, b, False, None
+def detect_brightest_pixels(img):
+    """Detect the brightest pixels in the image"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    threshold = np.percentile(gray, 90)  # Top 10% brightest pixels
+    _, mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+    return mask, np.sum(mask > 0) > 100
 
-def find_inliers(m, b, shape, vertical=False, x0=None):
-    h, w = shape
-    if vertical:
-        x = int(np.clip(round(x0), 0, w - 1)) # type: ignore
-        return x, 0, x, h - 1
-    
-    x1 = 0
-    y1 = m * x1 + b
-    x2 = w - 1
-    y2 = m * x2 + b
-    
-    y1 = int(np.clip(round(y1), 0, h - 1))
-    y2 = int(np.clip(round(y2), 0, h - 1))
-    return x1, y1, x2, y2
+def detect_adaptive_threshold(img):
+    """Use adaptive thresholding"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 21, 10)
+    return mask, np.sum(mask > 0) > 100
 
-def _large_contour_info(contours, area_min=AREA_MIN):
-    infos = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < area_min:
-            continue
-        x, y, w, h = cv2.boundingRect(cnt)
-        ar = h / max(w, 1)  
-        xc = x + w / 2.0
-        yc = y + h / 2.0
-        vert_score = ar * area
-        infos.append(dict(
-            cnt=cnt, area=area, x=x, y=y, w=w, h=h,
-            xc=xc, yc=yc, ar=ar, vert_score=vert_score
-        ))
-    return infos
-
-def _cluster_by_x(infos, tol=X_CLUSTER_PX):
-    if not infos:
-        return []
-    infos_sorted = sorted(infos, key=lambda d: d['xc'])
-    clusters = []
-    current = [infos_sorted[0]]
-    last_x = infos_sorted[0]['xc']
-    for d in infos_sorted[1:]:
-        if abs(d['xc'] - last_x) <= tol:
-            current.append(d)
-        else:
-            clusters.append(current)
-            current = [d]
-        last_x = d['xc']
-    clusters.append(current)
-    return clusters
-
-def _cluster_metrics(cluster):
-    areas = [d['area'] for d in cluster]
-    ars   = [d['ar'] for d in cluster]
-    xcs   = [d['xc'] for d in cluster]
-    xs    = [d['x'] for d in cluster]
-    ys    = [d['y'] for d in cluster]
-    ws    = [d['w'] for d in cluster]
-    hs    = [d['h'] for d in cluster]
-
-    x_min = min(xs)
-    y_min = min(ys)
-    x_max = max([x+w for x,w in zip(xs,ws)])
-    y_max = max([y+h for y,h in zip(ys,hs)])
-    w_tot = x_max - x_min
-    h_tot = y_max - y_min
-    ar_tot = h_tot / max(w_tot, 1)
-
-    vert_score = sum(d['vert_score'] for d in cluster)
-
-    return dict(
-        contours=[d['cnt'] for d in cluster],
-        area=sum(areas),
-        ar=ar_tot,
-        x=x_min, y=y_min, w=w_tot, h=h_tot,
-        xc=float(np.median(xcs)),
-        vert_score=vert_score
-    )
-
-def select_best_vertical_band(contours, area_min=AREA_MIN, ar_min=AR_MIN, merge_tol=X_CLUSTER_PX, thresh=None):
-    cluster_start = time.perf_counter()
-    
-    info_start = time.perf_counter()
-    infos = _large_contour_info(contours, area_min=area_min)
-    info_time = time.perf_counter() - info_start
-    #print(f"    [CLUSTER] Contour info extraction took: {info_time*1000:.3f}ms (processed {len(infos)} valid contours)")
-    
-    if not infos:
-        return None, False, None, None, False
-
-    group_start = time.perf_counter()
-    clusters = _cluster_by_x(infos, tol=merge_tol)
-    cluster_infos = [_cluster_metrics(c) for c in clusters]
-    group_time = time.perf_counter() - group_start
-    #print(f"    [CLUSTER] Grouping and metrics took: {group_time*1000:.3f}ms (created {len(clusters)} clusters)")
-
-    best_start = time.perf_counter()
-    best = max(cluster_infos, key=lambda d: d['vert_score'])
-
-    mask = np.zeros_like(thresh, dtype=np.uint8)  
-    cv2.drawContours(mask, best['contours'], -1, 255, thickness=-1) # type: ignore
-
-    is_vertical = (best['ar'] >= ar_min) # type: ignore
-    best_time = time.perf_counter() - best_start
-    #print(f"    [CLUSTER] Best selection and mask creation took: {best_time*1000:.3f}ms")
-
-    total_cluster = time.perf_counter() - cluster_start
-    #print(f"    [CLUSTER] Total clustering took: {total_cluster*1000:.3f}ms")
-
-    return mask, is_vertical, best['xc'], best, True
-
+def detect_color_edges(img):
+    """Detect edges and assume they might be lines"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    # Dilate edges to make them thicker
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.dilate(edges, kernel, iterations=2)
+    return mask, np.sum(mask > 0) > 100
 
 def process_linreg(img):
-    process_start = time.perf_counter()  # More precise timer
-    #print(f"  [LINREG] Starting linear regression processing (image shape: {img.shape})")
+    """
+    Simple line detection using OpenCV fitLine.
+    Args:
+        img: Input image (BGR format)
+    Returns:
+        tuple: (display_img, line_info) where line_info contains:
+               {'x': x_position, 'y': y_position, 'vx': direction_x, 'vy': direction_y, 
+                'slope': slope, 'intercept': intercept, 'is_vertical': bool, 'confidence': float}
+               or None if no line detected
+    """
+    print(f"  [LINREG] Starting simple line processing (image shape: {img.shape})")
     
-    # Keep all original processing logic, just remove matplotlib
-    gray_start = time.perf_counter()
-    imgray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray_time = time.perf_counter() - gray_start
-    #print(f"  [LINREG] Color conversion took: {gray_time*1000:.3f}ms")
-
-    morph_start = time.perf_counter()
-    kernel_dilation = np.ones((5, 5), np.uint8)
-    dilation = cv2.dilate(imgray, kernel_dilation, iterations=4)
+    # Create working copy
+    result_img = img.copy()
     
-    kernel_blur = np.ones((5, 5), np.float32) / 25
-    blur = cv2.filter2D(dilation, -1, kernel_blur)
+    # First, let's analyze the actual image content
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    print(f"  [LINREG] Image stats: min={np.min(gray)}, max={np.max(gray)}, mean={np.mean(gray):.1f}")
+    print(f"  [LINREG] Unique values in first 10 pixels: {np.unique(gray.flatten()[:10])}")
     
-    # Enhanced image processing with multiple methods
-    # Very low threshold to catch any white lines
-    _, thresh1 = cv2.threshold(blur, 100, 255, cv2.THRESH_BINARY)
+    # Try multiple detection strategies
+    detection_methods = [
+        ("white_strict", lambda: detect_white_strict(img)),
+        ("white_relaxed", lambda: detect_white_relaxed(img)),
+        ("brightest_pixels", lambda: detect_brightest_pixels(img)),
+        ("adaptive_threshold", lambda: detect_adaptive_threshold(img)),
+        ("color_edges", lambda: detect_color_edges(img))
+    ]
     
-    # Adaptive thresholding to handle varying lighting
-    thresh2 = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                  cv2.THRESH_BINARY, 11, 2)
-    
-    # Edge detection to find line boundaries
-    edges = cv2.Canny(blur, 50, 150)
-    kernel = np.ones((5,5), np.uint8)
-    edges_dilated = cv2.dilate(edges, kernel, iterations=1)
-    
-    # Combine all methods
-    thresh = cv2.bitwise_or(cv2.bitwise_or(thresh1, thresh2), edges_dilated)
-    
-    morph_time = time.perf_counter() - morph_start
-    #print(f"  [LINREG] Morphological operations took: {morph_time*1000:.3f}ms")
-    
-    contour_start = time.perf_counter()
-    contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    contour_time = time.perf_counter() - contour_start
-    print(f"  [LINREG] Contour finding took: {contour_time*1000:.3f}ms (found {len(contours)} contours)")
-    
-    cluster_start = time.perf_counter()
-    mask, cluster_vertical, xc, cluster_info, found_big = select_best_vertical_band(
-        contours, area_min=AREA_MIN, ar_min=AR_MIN, merge_tol=X_CLUSTER_PX, thresh=thresh
-    )
-    cluster_time = time.perf_counter() - cluster_start
-    print(f"  [LINREG] Clustering took: {cluster_time*1000:.3f}ms")
-    
-    regression_start = time.perf_counter()
-    if found_big:
-        pts_src = mask
-    else:
-        pts_src = thresh  
-    
-    pts = np.column_stack(np.nonzero(pts_src)) # type: ignore
-    
-    force_vertical = cluster_vertical and found_big
-    
-    if force_vertical:
-        m = b = np.nan
-        vertical = True
-        x0 = xc
-    else:
-        m, b, vertical, x0 = calculate_regression(pts)
-    regression_time = time.perf_counter() - regression_start
-    #print(f"  [LINREG] Regression calculation took: {regression_time*1000:.3f}ms (processed {len(pts)} points)")
-    
-    # Create display image with original processing results
-    draw_start = time.perf_counter()
-    display_img = img.copy()
-    for cnt in contours:
-        if cv2.contourArea(cnt) < AREA_MIN:
+    for method_name, method_func in detection_methods:
+        print(f"  [LINREG] Trying method: {method_name}")
+        try:
+            binary, valid = method_func()
+            white_pixels = np.sum(binary > 0)
+            print(f"  [LINREG] Method {method_name}: {white_pixels} pixels found, valid={valid}")
+            if valid:
+                print(f"  [LINREG] SUCCESS with method: {method_name}")
+                break
+        except Exception as e:
+            print(f"  [LINREG] Method {method_name} failed: {e}")
             continue
-        x, y, w, h = cv2.boundingRect(cnt)
-        cv2.rectangle(display_img, (x, y), (x + w, y + h), (0, 255, 0), 5)
-    
-    if found_big and cluster_info is not None:
-        x = int(cluster_info['x']); y = int(cluster_info['y']) # type: ignore
-        w = int(cluster_info['w']); h = int(cluster_info['h']) # type: ignore
-        cv2.rectangle(display_img, (x, y), (x + w, y + h), (255, 0, 255), 5)
-    
-    # Draw the regression line using OpenCV instead of matplotlib
-    if vertical:
-        x = int(np.clip(round(x0), 0, imgray.shape[1] - 1)) # type: ignore
-        cv2.line(display_img, (x, 0), (x, imgray.shape[0] - 1), (0, 255, 0), 5)
-    elif not np.isnan(m) and not np.isnan(b):
-        x1, y1, x2, y2 = find_inliers(m, b, imgray.shape, vertical=False)
-        cv2.line(display_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
-    draw_time = time.perf_counter() - draw_start
-    print(f"  [LINREG] Drawing took: {draw_time*1000:.3f}ms")
-    
-    total_time = time.perf_counter() - process_start
-    print(f"  [LINREG] Total processing took: {total_time*1000:.3f}ms")
-
-    if vertical:
-        x = int(np.clip(round(x0), 0, imgray.shape[1] - 1)) # type: ignore
-        cv2.line(display_img, (x, 0), (x, imgray.shape[0] - 1), (0, 255, 0), 5)
-        # Store vertical line endpoints
-        line_points = (x, 0, x, imgray.shape[0] - 1)
-    elif not np.isnan(m) and not np.isnan(b):
-        x1, y1, x2, y2 = find_inliers(m, b, imgray.shape, vertical=False)
-        cv2.line(display_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
-        # Store normal line endpoints
-        line_points = (x1, y1, x2, y2)
     else:
-        line_points = None
-
+        print("  [LINREG] All detection methods failed")
+        # Create a basic visualization showing we tried but failed
+        result_color = img.copy()
+        cv2.rectangle(result_color, (5, 5), (300, 80), (0, 0, 0), -1)  # Black background
+        cv2.putText(result_color, "NO LINE DETECTED", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(result_color, "All methods failed", (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        # Add center crosshair
+        rows, cols = img.shape[:2]
+        img_center_x = cols // 2
+        img_center_y = rows // 2
+        cv2.line(result_color, (img_center_x - 30, img_center_y), (img_center_x + 30, img_center_y), (255, 255, 255), 3)
+        cv2.line(result_color, (img_center_x, img_center_y - 30), (img_center_x, img_center_y + 30), (255, 255, 255), 3)
+        
+        return result_color, None
+    
+    # Now we have a binary mask from one of the detection methods
+    # Find line points for cv2.fitLine
+    points = np.argwhere(binary > 0)
+    print(f"  [LINREG] Line points found: {len(points)}")
+    
+    if len(points) < 10:  # Need minimum points for reliable fitting
+        print("  [LINREG] Insufficient points for line fitting")
+        return result_img, None
+    
+    # Convert points to (x,y) format for cv2.fitLine
+    points = points[:, ::-1]  # swap (row,col) to (x,y)
+    
+    # Fit line using OpenCV's robust line fitting
+    line_fit = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
+    vx, vy, x0, y0 = line_fit.flatten()  # extract scalars from numpy arrays
+    
+    # Calculate line parameters
+    rows, cols = binary.shape
+    
+    # Calculate line endpoints for visualization
+    lefty = int((-x0 * vy / vx) + y0) if vx != 0 else 0
+    righty = int(((cols - x0) * vy / vx) + y0) if vx != 0 else rows
+    
+    # Create visualization on original image for better debugging
+    result_color = img.copy()  # Use original image as base
+    
+    # Create a 3-channel version of binary for proper overlay
+    if len(binary.shape) == 2:
+        binary_3ch = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    else:
+        binary_3ch = binary.copy()
+    
+    # Overlay detected line pixels in green for visibility
+    line_overlay = np.zeros_like(result_color)
+    # Set green pixels where line was detected
+    mask_indices = binary > 0
+    line_overlay[mask_indices] = [0, 255, 0]  # Green pixels where line detected
+    
+    # Blend the overlay with the original image
+    result_color = cv2.addWeighted(result_color, 0.7, line_overlay, 0.3, 0)
+    
+    # Draw fitted line in bright red for high visibility
+    if abs(vx) > 1e-6:  # Not vertical
+        cv2.line(result_color, (cols - 1, righty), (0, lefty), (0, 0, 255), 5)  # Thick red line
+    else:  # Vertical line
+        cv2.line(result_color, (int(x0), 0), (int(x0), rows-1), (0, 0, 255), 5)  # Vertical red line
+    
+    # Add reference point and direction vector visualization
+    center_x = int(x0)
+    center_y = int(y0)
+    cv2.circle(result_color, (center_x, center_y), 15, (255, 0, 255), -1)  # Magenta center point (larger)
+    
+    # Draw direction arrow
+    arrow_length = 100
+    end_x = int(center_x + arrow_length * vx)
+    end_y = int(center_y + arrow_length * vy)
+    cv2.arrowedLine(result_color, (center_x, center_y), (end_x, end_y), (0, 255, 255), 6)  # Cyan arrow (thicker)
+    
+    # Add text background for better readability
+    cv2.rectangle(result_color, (5, 5), (400, 160), (0, 0, 0), -1)  # Black background
+    
+    print(f"  [LINREG] Visualization: center=({center_x},{center_y}), arrow_end=({end_x},{end_y})")
+    print(f"  [LINREG] Line endpoints: ({0},{lefty}) to ({cols-1},{righty})")
+    print(f"  [LINREG] Binary mask has {np.sum(binary > 0)} white pixels")
+    
+    # Calculate slope and intercept
+    if abs(vx) > 1e-6:
+        slope = vy / vx
+        intercept = y0 - slope * x0
+        is_vertical = False
+    else:
+        slope = np.inf
+        intercept = np.nan
+        is_vertical = True
+    
+    # Calculate confidence based on number of inlier points
+    confidence = min(1.0, len(points) / 1000.0)  # Simple confidence metric
+    
+    # Add comprehensive debug info to visualization with better visibility
+    cv2.putText(result_color, f"Confidence: {confidence:.3f}", (10, 30), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(result_color, f"Center: ({center_x}, {center_y})", (10, 60), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(result_color, f"Direction: ({vx:.3f}, {vy:.3f})", (10, 90), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(result_color, f"Points: {len(points)}", (10, 120), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(result_color, f"Method: {method_name}", (10, 150), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    
+    # Add image center crosshair for reference (bright white)
+    img_center_x = cols // 2
+    img_center_y = rows // 2
+    cv2.line(result_color, (img_center_x - 30, img_center_y), (img_center_x + 30, img_center_y), (255, 255, 255), 3)
+    cv2.line(result_color, (img_center_x, img_center_y - 30), (img_center_x, img_center_y + 30), (255, 255, 255), 3)
+    
+    print(f"  [LINREG] Line detected: pos=({x0:.1f},{y0:.1f}), dir=({vx:.3f},{vy:.3f}), conf={confidence:.3f}")
+    
+    # Prepare line info for the controller - using field names expected by detector.py
     line_info = {
-        'slope': m if not vertical else np.nan,
-        'intercept': b if not vertical else np.nan,
-        'is_vertical': vertical,
-        'x_position': x0 if vertical else np.nan,
-        'points': line_points
+        'x_position': float(x0),      # Expected by detector.py
+        'y_position': float(y0),      # Expected by detector.py
+        'direction_x': float(vx),     # Expected by detector.py for curve support
+        'direction_y': float(vy),     # Expected by detector.py for curve support
+        'slope': float(slope),
+        'intercept': float(intercept),
+        'is_vertical': is_vertical,
+        'confidence': confidence,
+        # Keep original names for backwards compatibility
+        'x': float(x0),
+        'y': float(y0), 
+        'vx': float(vx),
+        'vy': float(vy)
     }
+    
+    return result_color, line_info
 
-    return display_img, line_info
+
+class linreg(Node):
+    def __init__(self):
+        super().__init__('linreg_test')
+        self.get_logger().info("Simple Line Regression Node Started")
+
+        self.image_sub = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
+        self.annotated_img_pub = self.create_publisher(Image, 'final_image', 10)
+
+    def image_callback(self, msg):
+        bridge = CvBridge()
+        try:
+            cv_image = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            
+            # Process line detection
+            result_img, line_info = process_linreg(cv_image)
+            
+            # Publish result image
+            ros_image_msg = bridge.cv2_to_imgmsg(result_img, encoding='bgr8')
+            self.annotated_img_pub.publish(ros_image_msg)
+            
+            # Log detection results
+            if line_info:
+                self.get_logger().info(f"Line detected: pos=({line_info['x']:.1f},{line_info['y']:.1f}), "
+                                     f"dir=({line_info['vx']:.3f},{line_info['vy']:.3f})")
+            else:
+                self.get_logger().info("No line detected")
+                
+        except Exception as e:
+            self.get_logger().error(f"Error in image processing: {str(e)}")
+
+        self.get_logger().info("Callback function running")
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = linreg()
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
