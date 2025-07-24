@@ -4,6 +4,10 @@ from sensor_msgs.msg import Image
 import cv2
 from cv_bridge import CvBridge 
 import numpy as np
+from .logging_framework import get_logger
+
+# Initialize component logger
+logger = get_logger('linreg')
 
 def detect_white_strict(img):
     """Detect white pixels with strict thresholds"""
@@ -52,15 +56,15 @@ def process_linreg(img):
                 'slope': slope, 'intercept': intercept, 'is_vertical': bool, 'confidence': float}
                or None if no line detected
     """
-    print(f"  [LINREG] Starting simple line processing (image shape: {img.shape})")
+    logger.debug("processing_details", f"Starting simple line processing (image shape: {img.shape})")
     
     # Create working copy
     result_img = img.copy()
     
     # First, let's analyze the actual image content
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    print(f"  [LINREG] Image stats: min={np.min(gray)}, max={np.max(gray)}, mean={np.mean(gray):.1f}")
-    print(f"  [LINREG] Unique values in first 10 pixels: {np.unique(gray.flatten()[:10])}")
+    logger.debug("pixel_analysis", f"Image stats: min={np.min(gray)}, max={np.max(gray)}, mean={np.mean(gray):.1f}")
+    logger.debug("pixel_analysis", f"Unique values in first 10 pixels: {np.unique(gray.flatten()[:10])}")
     
     # Try multiple detection strategies
     detection_methods = [
@@ -72,19 +76,19 @@ def process_linreg(img):
     ]
     
     for method_name, method_func in detection_methods:
-        print(f"  [LINREG] Trying method: {method_name}")
+        logger.debug("method_attempts", f"Trying method: {method_name}")
         try:
             binary, valid = method_func()
             white_pixels = np.sum(binary > 0)
-            print(f"  [LINREG] Method {method_name}: {white_pixels} pixels found, valid={valid}")
+            logger.debug("method_attempts", f"Method {method_name}: {white_pixels} pixels found, valid={valid}")
             if valid:
-                print(f"  [LINREG] SUCCESS with method: {method_name}")
+                logger.debug("method_attempts", f"SUCCESS with method: {method_name}")
                 break
         except Exception as e:
-            print(f"  [LINREG] Method {method_name} failed: {e}")
+            logger.debug("method_attempts", f"Method {method_name} failed: {e}")
             continue
     else:
-        print("  [LINREG] All detection methods failed")
+        logger.info("detection_events", "All detection methods failed")
         
         result_color = img.copy()
         cv2.rectangle(result_color, (5, 5), (300, 80), (0, 0, 0), -1)  # Black background
@@ -105,10 +109,10 @@ def process_linreg(img):
     # Now we have a binary mask from one of the detection methods
     # Find line points for cv2.fitLine
     points = np.argwhere(binary > 0)
-    print(f"  [LINREG] Line points found: {len(points)}")
+    logger.debug("processing_details", f"Line points found: {len(points)}")
     
     if len(points) < 10:  # Need minimum points for reliable fitting
-        print("  [LINREG] Insufficient points for line fitting")
+        logger.info("detection_events", "Insufficient points for line fitting")
         return result_img, None
     
     # Convert points to (x,y) format for cv2.fitLine
@@ -163,9 +167,9 @@ def process_linreg(img):
     # Add text background for better readability
     cv2.rectangle(result_color, (5, 5), (400, 160), (0, 0, 0), -1)  # Black background
     
-    print(f"  [LINREG] Visualization: center=({center_x},{center_y}), arrow_end=({end_x},{end_y})")
-    print(f"  [LINREG] Line endpoints: ({0},{lefty}) to ({cols-1},{righty})")
-    print(f"  [LINREG] Binary mask has {np.sum(binary > 0)} white pixels")
+    logger.debug("visualization_info", f"Visualization: center=({center_x},{center_y}), arrow_end=({end_x},{end_y})")
+    logger.debug("visualization_info", f"Line endpoints: ({0},{lefty}) to ({cols-1},{righty})")
+    logger.debug("visualization_info", f"Binary mask has {np.sum(binary > 0)} white pixels")
     
     # Calculate slope and intercept
     if abs(vx) > 1e-6:
@@ -198,7 +202,7 @@ def process_linreg(img):
     cv2.line(result_color, (img_center_x - 30, img_center_y), (img_center_x + 30, img_center_y), (255, 255, 255), 3)
     cv2.line(result_color, (img_center_x, img_center_y - 30), (img_center_x, img_center_y + 30), (255, 255, 255), 3)
     
-    print(f"  [LINREG] Line detected: pos=({x0:.1f},{y0:.1f}), dir=({vx:.3f},{vy:.3f}), conf={confidence:.3f}")
+    logger.info("detection_events", f"Line detected: pos=({x0:.1f},{y0:.1f}), dir=({vx:.3f},{vy:.3f}), conf={confidence:.3f}")
     
     # Prepare line info for the controller - using field names expected by detector.py
     line_info = {
@@ -223,7 +227,8 @@ def process_linreg(img):
 class linreg(Node):
     def __init__(self):
         super().__init__('linreg_test')
-        self.get_logger().info("Simple Line Regression Node Started")
+        self.logger = get_logger('linreg')
+        self.logger.system("startup", "Simple Line Regression Node Started")
 
         self.image_sub = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
         self.annotated_img_pub = self.create_publisher(Image, 'final_image', 10)
@@ -242,15 +247,15 @@ class linreg(Node):
             
             # Log detection results
             if line_info:
-                self.get_logger().info(f"Line detected: pos=({line_info['x']:.1f},{line_info['y']:.1f}), "
+                self.logger.info("detection_events", f"Line detected: pos=({line_info['x']:.1f},{line_info['y']:.1f}), "
                                      f"dir=({line_info['vx']:.3f},{line_info['vy']:.3f})")
             else:
-                self.get_logger().info("No line detected")
+                self.logger.info("detection_events", "No line detected")
                 
         except Exception as e:
-            self.get_logger().error(f"Error in image processing: {str(e)}")
+            self.logger.error("errors", f"Error in image processing: {str(e)}")
 
-        self.get_logger().info("Callback function running")
+        self.logger.debug("processing_details", "Callback function running")
 
 
 def main(args=None):

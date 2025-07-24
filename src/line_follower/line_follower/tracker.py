@@ -8,6 +8,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus
 from line_interfaces.msg import Line
 import tf_transformations as tft
+from .logging_framework import get_logger
 
 #############
 # CONSTANTS #
@@ -163,6 +164,9 @@ class LineController(Node):
     def __init__(self) -> None:
         super().__init__('line_controller')
 
+        # Initialize custom logger
+        self.logger = get_logger('tracker')
+
         # Create CoordTransforms instance
         self.coord_transforms = CoordTransforms()
 
@@ -222,24 +226,24 @@ class LineController(Node):
         """Send an arm command to the vehicle."""
         self.publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
-        self.get_logger().info('Arm command sent')
+        self.logger.system('system_events', 'Arm command sent')
 
     def disarm(self):
         """Send a disarm command to the vehicle."""
         self.publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
-        self.get_logger().info('Disarm command sent')
+        self.logger.system('system_events', 'Disarm command sent')
 
     def engage_offboard_mode(self):
         """Switch to offboard mode."""
         self.publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
-        self.get_logger().info("Switching to offboard mode")
+        self.logger.system('system_events', "Switching to offboard mode")
 
     def land(self):
         """Switch to land mode."""
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
-        self.get_logger().info("Switching to land mode")
+        self.logger.system('system_events', "Switching to land mode")
 
     def publish_offboard_control_heartbeat_signal(self):
         """Publish the offboard control mode."""
@@ -264,7 +268,7 @@ class LineController(Node):
         msg.yawspeed = wz
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.trajectory_setpoint_publisher.publish(msg)
-        # self.get_logger().info(f"Publishing velocity setpoints {[vx, vy, wz]}")
+        self.logger.debug('velocity_commands', f"Publishing velocity setpoints {[vx, vy, wz]}")
 
     def publish_vehicle_command(self, command, **params) -> None:
         """Publish a vehicle command."""
@@ -287,7 +291,7 @@ class LineController(Node):
 
     def convert_velocity_setpoints(self):
         # Debug input values
-        self.get_logger().info(f"Converting DC velocities: vx={self.vx__dc:.3f}, vy={self.vy__dc:.3f}, wz={self.wz__dc:.3f}")
+        self.logger.debug('coordinate_transform', f"Converting DC velocities: vx={self.vx__dc:.3f}, vy={self.vy__dc:.3f}, wz={self.wz__dc:.3f}")
         
         # Set linear velocity (convert command velocity from downward camera frame to bd frame)
         vx, vy, vz = self.coord_transforms.static_transform((self.vx__dc, self.vy__dc, self.vz__dc), 'dc', 'bd')
@@ -295,7 +299,7 @@ class LineController(Node):
         # Set angular velocity (convert command angular velocity from downward camera to bd frame)
         _, _, wz = self.coord_transforms.static_transform((0.0, 0.0, self.wz__dc), 'dc', 'bd')
 
-        self.get_logger().info(f"After coordinate transform: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
+        self.logger.debug('coordinate_transform', f"After coordinate transform: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
 
         # enforce safe velocity limits
         if _MAX_SPEED < 0.0 or _MAX_CLIMB_RATE < 0.0 or _MAX_ROTATION_RATE < 0.0:
@@ -304,7 +308,7 @@ class LineController(Node):
         vy = min(max(vy,-_MAX_SPEED), _MAX_SPEED)
         wz = min(max(wz,-_MAX_ROTATION_RATE), _MAX_ROTATION_RATE)
 
-        self.get_logger().info(f"After velocity limits: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
+        self.logger.debug('velocity_commands', f"After velocity limits: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
         return (vx, vy, wz)
     
     def timer_callback(self) -> None:
@@ -328,7 +332,7 @@ class LineController(Node):
             Args:
                 - param: parameters that define the center and direction of detected line
         """
-        self.get_logger().info("Line detected, following line")
+        self.logger.info("line_detection", "Line detected, following line")
         # Extract line parameters
         x, y, vx, vy = param.x, param.y, param.vx, param.vy
         
@@ -347,8 +351,8 @@ class LineController(Node):
         error_y = target_y - CENTER[1]
         
         # Debug info - show what we received
-        self.get_logger().info(f"Line at ({x:.1f}, {y:.1f}), direction ({vx:.2f}, {vy:.2f})")
-        self.get_logger().info(f"Target at ({target_x:.1f}, {target_y:.1f}), errors ({error_x:.1f}, {error_y:.1f})")
+        self.logger.debug("line_detection", f"Line at ({x:.1f}, {y:.1f}), direction ({vx:.2f}, {vy:.2f})")
+        self.logger.debug("line_detection", f"Target at ({target_x:.1f}, {target_y:.1f}), errors ({error_x:.1f}, {error_y:.1f})")
         
         # SIMPLIFIED CONTROL LOGIC - direct proportional control
         # For lateral control: error_x directly controls lateral movement
@@ -365,11 +369,11 @@ class LineController(Node):
         self.wz__dc = KP_Z_W * angular_error / 10.0  # Reduce oscillation
         
         # Debug control outputs before coordinate transformation
-        self.get_logger().info(f"DC frame commands: vx={self.vx__dc:.3f}, vy={self.vy__dc:.3f}, wz={self.wz__dc:.3f}")
+        self.logger.debug("control_loops", f"DC frame commands: vx={self.vx__dc:.3f}, vy={self.vy__dc:.3f}, wz={self.wz__dc:.3f}")
         
         # Convert and publish velocity commands
         vx_bd, vy_bd, wz_bd = self.convert_velocity_setpoints()
-        self.get_logger().info(f"BD frame commands: vx={vx_bd:.3f}, vy={vy_bd:.3f}, wz={wz_bd:.3f}")
+        self.logger.debug("control_loops", f"BD frame commands: vx={vx_bd:.3f}, vy={vy_bd:.3f}, wz={wz_bd:.3f}")
         self.publish_trajectory_setpoint(vx_bd, vy_bd, wz_bd)
     
     def normalize_angle(self, angle):
@@ -381,7 +385,8 @@ class LineController(Node):
         return angle
 
 def main(args=None) -> None:
-    print('Starting offboard control node...')
+    logger = get_logger('system')
+    logger.system('startup', 'Starting offboard control node...')
     rclpy.init(args=args)
     offboard_control = LineController()
     rclpy.spin(offboard_control)
@@ -393,4 +398,5 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as e:
-        print(e)
+        logger = get_logger('system')
+        logger.error('errors', str(e))

@@ -14,6 +14,7 @@ from cv_bridge import CvBridge, CvBridgeError
 from line_interfaces.msg import Line
 import sys
 from .linreg import process_linreg
+from .logging_framework import get_logger
 
 #############
 # CONSTANTS #
@@ -29,6 +30,9 @@ FOV_REDUCTION = 0.6
 class LineDetector(Node):
     def __init__(self):
         super().__init__('detector')
+
+        # Initialize custom logger
+        self.logger = get_logger('detector')
 
         # A subscriber to the topic '/aero_downward_camera/image'
         self.camera_sub = self.create_subscription(
@@ -79,7 +83,7 @@ class LineDetector(Node):
             self.original_width = width
             self.original_height = height
             self.original_center = (width // 2, height // 2)
-            self.get_logger().info(f"Original image dimensions: {width}x{height}")
+            self.logger.info("image_info", f"Original image dimensions: {width}x{height}")
         
         # Calculate new dimensions
         new_width = int(width * crop_factor)
@@ -93,7 +97,7 @@ class LineDetector(Node):
         
         # Crop the image
         cropped_img = img[start_y:end_y, start_x:end_x]
-        self.get_logger().info(f"Cropped image to {new_width}x{new_height} (FOV reduced by {(1-crop_factor)*100}%)")
+        self.logger.debug("image_info", f"Cropped image to {new_width}x{new_height} (FOV reduced by {(1-crop_factor)*100}%)")
         
         return cropped_img
 
@@ -148,10 +152,10 @@ class LineDetector(Node):
         
         # Choose the direction with smaller angular distance
         if dist1 <= dist2:
-            self.get_logger().info(f"Chose direction1: angular dist = {dist1:.3f} vs {dist2:.3f}")
+            self.logger.debug("curve_detection", f"Chose direction1: angular dist = {dist1:.3f} vs {dist2:.3f}")
             return direction1
         else:
-            self.get_logger().info(f"Chose direction2: angular dist = {dist2:.3f} vs {dist1:.3f}")
+            self.logger.debug("curve_detection", f"Chose direction2: angular dist = {dist2:.3f} vs {dist1:.3f}")
             return direction2
 
     ######################
@@ -199,7 +203,7 @@ class LineDetector(Node):
             msg.vy = float(line[3])
             # Publish param msg
             self.param_pub.publish(msg)
-            self.get_logger().info(f"Published line: x={line[0]}, y={line[1]}, vx={line[2]}, vy={line[3]}")
+            self.logger.debug("processing_steps", f"Published line: x={line[0]}, y={line[1]}, vx={line[2]}, vy={line[3]}")
 
         # Publish annotated image if DISPLAY is True and a line was detected
         if DISPLAY and line is not None:
@@ -266,7 +270,7 @@ class LineDetector(Node):
             x = x0
             y = y0
             
-            self.get_logger().info(f"Using curve-fitted direction: vx={vx:.3f}, vy={vy:.3f}")
+            self.logger.debug("curve_detection", f"Using curve-fitted direction: vx={vx:.3f}, vy={vy:.3f}")
         else:
             # Fallback to traditional slope-based calculation
             if vertical:
@@ -306,7 +310,7 @@ class LineDetector(Node):
         self.previous_direction = (vx, vy)
         self.detection_count += 1
         
-        self.get_logger().info(f"Detected line: x={x}, y={y}, vx={vx}, vy={vy} (detection #{self.detection_count})")
+        self.logger.info("curve_detection", f"Detected line: x={x}, y={y}, vx={vx}, vy={vy} (detection #{self.detection_count})")
         return (x, y, vx, vy)
 
 
@@ -314,13 +318,14 @@ class LineDetector(Node):
 def main(args=None):
     rclpy.init(args=args)
     detector = LineDetector()
-    detector.get_logger().info("Line detector initialized")
+    system_logger = get_logger('system')
+    system_logger.system("startup", "Line detector initialized")
     try:
         rclpy.spin(detector)
     except KeyboardInterrupt:
-        print("Shutting down")
+        system_logger.system("startup", "Shutting down")
     except Exception as e:
-        print(e)
+        system_logger.error("errors", str(e))
     finally:
         detector.destroy_node()
         rclpy.shutdown()
