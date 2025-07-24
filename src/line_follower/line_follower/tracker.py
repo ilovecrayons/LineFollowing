@@ -20,8 +20,8 @@ IMAGE_HEIGHT = 576  # Updated to match actual cropped image dimensions
 IMAGE_WIDTH = 768   # Updated to match actual cropped image dimensions
 CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2]) # Center of the image frame. We will treat this as the center of mass of the drone
 EXTEND = 300 # Number of pixels forward to extrapolate the line
-KP_X = 1    # Increased for more responsive lateral control
-KP_Y = 1    # Increased for more responsive forward/backward control
+KP_X = 0.8    # Increased for more responsive lateral control
+KP_Y = 0.8    # Increased for more responsive forward/backward control
 KP_Z_W = 2.0  # Reduced to prevent oscillation
 DISPLAY = True
 

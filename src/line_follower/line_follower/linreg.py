@@ -85,7 +85,7 @@ def process_linreg(img):
             continue
     else:
         print("  [LINREG] All detection methods failed")
-        # Create a basic visualization showing we tried but failed
+        
         result_color = img.copy()
         cv2.rectangle(result_color, (5, 5), (300, 80), (0, 0, 0), -1)  # Black background
         cv2.putText(result_color, "NO LINE DETECTED", (10, 30), 
