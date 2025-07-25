@@ -14,14 +14,14 @@ from .logging_framework import Logger, LoggerColors
 # CONSTANTS #
 #############
 _RATE = 10 # (Hz) rate for rospy.rate
-_MAX_SPEED = 1.5 # (m/s)
+_MAX_SPEED = 0.7 # (m/s)
 _MAX_CLIMB_RATE = 1.0 # m/s
 _MAX_ROTATION_RATE = 5.0 # rad/s 
 IMAGE_HEIGHT = 576  # Updated to match actual cropped image dimensions
 IMAGE_WIDTH = 768   # Updated to match actual cropped image dimensions
 CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2]) # Center of the image frame. We will treat this as the center of mass of the drone
 EXTEND = 300 # Number of pixels forward to extrapolate the line
-KP_X = 0.7   # Increased for more responsive lateral control
+KP_X = 10   # Increased for more responsive lateral control
 KP_Y = 0.7 # Increased for more responsive forward/backward control
 KP_Z_W = 1.5  # Reduced to prevent oscillation
 DISPLAY = True
@@ -394,7 +394,7 @@ class LineController(Node):
         # Calculate angular error (difference between desired and current heading)
         angular_error = self.normalize_angle(desired_heading - current_heading)
         
-        # FIXED: Calculate yaw rate with priority
+        # Calculate yaw rate
         self.wz__dc = KP_Z_W * angular_error
         
         # Store previous heading for tracking
@@ -402,30 +402,38 @@ class LineController(Node):
         heading_change = self.normalize_angle(current_heading - prev_heading)
         self._prev_heading = current_heading
         
-        # CRITICAL FIX: Calculate velocity differently based on angular error
-        # If large angular error, prioritize rotation first, then move
+        # SIMPLIFIED: Clearer control logic with fewer calculations
         if abs(angular_error) > np.radians(30):  # If more than 30 degrees off
-            # Prioritize rotation - only minimal forward motion
+            # ROTATION MODE: Pure rotation with minimal movement
             self.vx__dc = 0.0
-            self.vy__dc = 0.1  # Small forward movement in camera frame
+            self.vy__dc = 0.05  # Very minimal forward movement
             
             self.logger.log("mode_change", LoggerColors.YELLOW, 
                           f"ROTATION MODE: Large angular error {math.degrees(angular_error):.1f}°", 1000)
         else:
-            # Normal line following with corrected velocity calculation
-            # Scale forward speed based on how aligned we are
-            alignment_factor = max(0, 1 - (abs(angular_error) / np.radians(30)))
-            forward_speed = 0.3 * alignment_factor  # Reduce speed when not fully aligned
+            # TRACKING MODE: Follow the line with lateral correction
+            # Basic movement in the direction of the line
+            self.vx__dc = vx * 0.2  # Moderate speed along x-component of line
+            self.vy__dc = vy * 0.2  # Moderate speed along y-component of line
             
-            # Simple, robust control approach:
-            # 1. Move forward along the line direction
-            # 2. Apply proportional lateral correction to stay centered
-            self.vx__dc = KP_X * error_x / 100.0  # Lateral correction
-            self.vy__dc = forward_speed  # Constant forward motion
+            # Add lateral correction - simple proportional control
+            # The sign is critical here - we need to move toward the line
+            correction = KP_X * error_x / 100.0
+            
+            # Apply correction perpendicular to line direction
+            # For a line pointing in (vx,vy), the perpendicular is (-vy,vx)
+            self.vx__dc += -vy * correction  # Perpendicular correction x-component
+            self.vy__dc += vx * correction   # Perpendicular correction y-component
             
             self.logger.log("mode_change", LoggerColors.GREEN, 
-                          f"TRACKING MODE: Forward speed {forward_speed:.2f}", 1000)
-            
+                          f"TRACKING MODE: Angular error {math.degrees(angular_error):.1f}°", 1000)
+        
+        # Add detailed logging
+        self.logger.log("direction_vectors", LoggerColors.BLUE, 
+                       f"Line direction: camera=({vx:.2f},{vy:.2f}), body=({vx_bd:.2f},{vy_bd:.2f})", 1000)
+        self.logger.log("velocity_vectors", LoggerColors.BLUE, 
+                       f"Velocity cmd: camera=({self.vx__dc:.2f},{self.vy__dc:.2f})", 1000)
+        
         # Log both the raw line direction and transformed direction
         self.logger.log("heading_control", LoggerColors.CYAN, 
                         f"Line direction in camera frame: ({vx:.2f}, {vy:.2f}), "
@@ -493,4 +501,7 @@ if __name__ == '__main__':
     main()
 if __name__ == '__main__':
     main()
-                       
+    main()
+    main()
+if __name__ == '__main__':
+    main()
