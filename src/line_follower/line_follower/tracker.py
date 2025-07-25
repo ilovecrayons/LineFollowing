@@ -21,13 +21,14 @@ IMAGE_HEIGHT = 576  # Updated to match actual cropped image dimensions
 IMAGE_WIDTH = 768   # Updated to match actual cropped image dimensions
 CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2]) # Center of the image frame. We will treat this as the center of mass of the drone
 EXTEND = 300 # Number of pixels forward to extrapolate the line
-KP_X = 10   # Increased for more responsive lateral control
-KP_Y = 0.7 # Increased for more responsive forward/backward control
-KP_Z_W = 1.5  # Reduced to prevent oscillation
+KP_X = 25   # Keep the same gain for small errors
+KP_Y = 0.7  # Keep forward speed consistent
+KP_Z_W = 1.5  # Keep heading control consistent
 DISPLAY = True
 
 # Control flags
 ENABLE_HORIZONTAL_VELOCITY = True  # Set to True to enable vx and vy output
+MAX_CORRECTION_FACTOR = 10.0  # Absolute maximum correction factor
 
 #########################
 # COORDINATE TRANSFORMS #
@@ -411,19 +412,76 @@ class LineController(Node):
             self.logger.log("mode_change", LoggerColors.YELLOW, 
                           f"ROTATION MODE: Large angular error {math.degrees(angular_error):.1f}°", 1000)
         else:
-            # TRACKING MODE: Follow the line with lateral correction
-            # Basic movement in the direction of the line
-            self.vx__dc = vx * 0.2  # Moderate speed along x-component of line
-            self.vy__dc = vy * 0.2  # Moderate speed along y-component of line
+            # IMPROVED TRACKING: Prioritize lateral position over forward motion
             
-            # Add lateral correction - simple proportional control
-            # The sign is critical here - we need to move toward the line
-            correction = KP_X * error_x / 100.0
+            # Calculate error magnitude - used to determine control mode
+            error_magnitude = abs(error_x)
             
-            # Apply correction perpendicular to line direction
-            # For a line pointing in (vx,vy), the perpendicular is (-vy,vx)
-            self.vx__dc += -vy * correction  # Perpendicular correction x-component
-            self.vy__dc += vx * correction   # Perpendicular correction y-component
+            # FIXED: Apply the same direct body frame approach to all recovery modes
+            if error_magnitude > 100:  # Far from line - position recovery or emergency
+                # Determine scales based on error severity
+                if error_magnitude > 200:  # Emergency recovery
+                    lateral_scale = 0.6  # 60% of max speed for lateral
+                    forward_scale = 0.0  # No forward motion
+                    recovery_type = "EMERGENCY RECOVERY"
+                else:  # Position recovery
+                    lateral_scale = 0.5  # 50% of max speed for lateral
+                    forward_scale = 0.02  # Minimal forward motion (reduced from 0.05)
+                    recovery_type = "POSITION RECOVERY"
+                
+                # FIXED: Use direct body frame control for consistent behavior in all recovery modes
+                # Calculate direct body frame velocities
+                if error_x > 0:  # Line is to the right of center
+                    # Move right in body frame
+                    body_vx = forward_scale * _MAX_SPEED  # Minimal or zero forward motion
+                    body_vy = lateral_scale * _MAX_SPEED  # Move right at specified scale
+                else:  # Line is to the left of center
+                    # Move left in body frame
+                    body_vx = forward_scale * _MAX_SPEED  # Minimal or zero forward motion
+                    body_vy = -lateral_scale * _MAX_SPEED  # Move left at specified scale
+                
+                # Convert body velocities back to camera frame
+                self.vx__dc, self.vy__dc, _ = self.coord_transforms.static_transform(
+                    (body_vx, body_vy, 0.0), 'bd', 'dc')
+                
+                self.logger.log("control_mode", LoggerColors.RED, 
+                              f"{recovery_type}: error_x={error_x:.1f}px (DIRECT CONTROL)", 1000)
+                
+                # Log the actual body frame velocities
+                self.logger.log("correction_details", LoggerColors.BLUE,
+                              f"DIRECT MOTION: body_vx={body_vx:.2f}, body_vy={body_vy:.2f}", 1000)
+            
+            else:  # Close to line - normal tracking
+                # Keep existing normal tracking code unchanged
+                lateral_scale = 0.2
+                forward_scale = 0.2
+                self.logger.log("control_mode", LoggerColors.GREEN, 
+                              f"NORMAL TRACKING: error_x={error_x:.1f}px", 1000)
+                
+                # Calculate correction factor
+                correction_factor = KP_X * error_x / 50.0
+                # Apply absolute limit to correction factor
+                correction_factor = max(min(correction_factor, MAX_CORRECTION_FACTOR), -MAX_CORRECTION_FACTOR)
+                
+                # Calculate perpendicular direction to the line
+                perpendicular_x = -vy  # Perpendicular to line direction
+                perpendicular_y = vx
+                
+                # Normalize perpendicular vector
+                perp_norm = np.sqrt(perpendicular_x**2 + perpendicular_y**2)
+                if perp_norm > 0:
+                    perpendicular_x /= perp_norm
+                    perpendicular_y /= perp_norm
+                
+                # Apply lateral correction and forward motion
+                self.vx__dc = perpendicular_x * correction_factor * lateral_scale
+                self.vy__dc = perpendicular_y * correction_factor * lateral_scale
+                self.vx__dc += vx * forward_scale
+                self.vy__dc += vy * forward_scale
+                
+                # Log correction details
+                self.logger.log("correction_details", LoggerColors.BLUE,
+                              f"Correction: factor={correction_factor:.2f}, scales=[lat:{lateral_scale:.2f},fwd:{forward_scale:.2f}]", 1000)
             
             self.logger.log("mode_change", LoggerColors.GREEN, 
                           f"TRACKING MODE: Angular error {math.degrees(angular_error):.1f}°", 1000)
@@ -494,14 +552,5 @@ def main(args=None) -> None:
     rclpy.shutdown()
 
 
-if __name__ == '__main__':
-    main()
-if __name__ == '__main__':
-    main()
-    main()
-if __name__ == '__main__':
-    main()
-    main()
-    main()
 if __name__ == '__main__':
     main()
