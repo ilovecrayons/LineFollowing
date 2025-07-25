@@ -23,11 +23,11 @@ CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2]) # Center of the image frame
 EXTEND = 300 # Number of pixels forward to extrapolate the line
 KP_X = 0.8    # Increased for more responsive lateral control
 KP_Y = 0.8    # Increased for more responsive forward/backward control
-KP_Z_W = 10  # Reduced to prevent oscillation
+KP_Z_W = 1.5  # Reduced to prevent oscillation
 DISPLAY = True
 
 # Control flags
-ENABLE_HORIZONTAL_VELOCITY = False  # Set to True to enable vx and vy output
+ENABLE_HORIZONTAL_VELOCITY = True  # Set to True to enable vx and vy output
 
 #########################
 # COORDINATE TRANSFORMS #
@@ -387,8 +387,8 @@ class LineController(Node):
         # For heading control: align with line direction
         vx_bd, vy_bd, _ = self.coord_transforms.static_transform((vx, vy, 0.0), 'dc', 'bd')
         
-        # Calculate desired heading in body frame - add 90° to correct offset
-        desired_heading = np.arctan2(vy_bd, vx_bd) + np.pi/2
+        # Calculate desired heading in body frame - FIXED: removed the π/2 offset
+        desired_heading = np.arctan2(vy_bd, vx_bd)
         
         # Calculate true angular error (difference between desired and current heading)
         angular_error = self.normalize_angle(desired_heading - current_heading)
@@ -467,4 +467,3 @@ def main(args=None) -> None:
 
 if __name__ == '__main__':
     main()
-    
