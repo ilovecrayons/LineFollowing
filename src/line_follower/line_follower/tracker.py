@@ -8,6 +8,9 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus
 from line_interfaces.msg import Line
 import tf_transformations as tft
+from line_follower.logger import logging_framework
+
+logger = logging_framework.Logger()
 
 #############
 # CONSTANTS #
@@ -261,7 +264,7 @@ class LineController(Node):
         else:
             msg.velocity = [vx, vy, 0.0]
         msg.acceleration = [None, None, None]
-        msg.yaw = float('nan')
+        # msg.yaw = float('nan')
         msg.yawspeed = wz
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.trajectory_setpoint_publisher.publish(msg)
@@ -287,16 +290,12 @@ class LineController(Node):
         self.vehicle_command_publisher.publish(msg)
 
     def convert_velocity_setpoints(self):
-        # Debug input values
-        self.get_logger().info(f"Converting DC velocities: vx={self.vx__dc:.3f}, vy={self.vy__dc:.3f}, wz={self.wz__dc:.3f}")
         
         # Set linear velocity (convert command velocity from downward camera frame to bd frame)
         vx, vy, vz = self.coord_transforms.static_transform((self.vx__dc, self.vy__dc, self.vz__dc), 'dc', 'bd')
 
         # Set angular velocity (convert command angular velocity from downward camera to bd frame)
         _, _, wz = self.coord_transforms.static_transform((0.0, 0.0, self.wz__dc), 'dc', 'bd')
-
-        self.get_logger().info(f"After coordinate transform: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
 
         # enforce safe velocity limits
         if _MAX_SPEED < 0.0 or _MAX_CLIMB_RATE < 0.0 or _MAX_ROTATION_RATE < 0.0:
@@ -305,7 +304,6 @@ class LineController(Node):
         vy = min(max(vy,-_MAX_SPEED), _MAX_SPEED)
         wz = min(max(wz,-_MAX_ROTATION_RATE), _MAX_ROTATION_RATE)
 
-        self.get_logger().info(f"After velocity limits: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
         return (vx, vy, wz)
     
     def timer_callback(self) -> None:
@@ -321,15 +319,11 @@ class LineController(Node):
     
     def line_sub_cb(self, param):
         """
-        Callback function which is called when a new message of type Line is recieved by self.line_sub.
-        Notes:
-        - This is the function that maps a detected line into a velocity 
-        command
-            
-            Args:
-                - param: parameters that define the center and direction of detected line
+        Fixed callback function - disable the incorrect yaw control that was causing issues.
+        The drone should follow the line, not align its heading with the line direction.
         """
-        self.get_logger().info("Line detected, following line")
+        logger.log("line_sub", logging_framework.LoggerColors.BLUE, "Received line parameters", 1000)
+        
         # Extract line parameters
         x, y, vx, vy = param.x, param.y, param.vx, param.vy
         
@@ -347,11 +341,7 @@ class LineController(Node):
         error_x = target_x - CENTER[0]
         error_y = target_y - CENTER[1]
         
-        # Debug info - show what we received
-        self.get_logger().info(f"Line at ({x:.1f}, {y:.1f}), direction ({vx:.2f}, {vy:.2f})")
-        self.get_logger().info(f"Target at ({target_x:.1f}, {target_y:.1f}), errors ({error_x:.1f}, {error_y:.1f})")
-        
-        # SIMPLIFIED CONTROL LOGIC - direct proportional control
+        # KEEP THE WORKING CONTROL LOGIC (this was working before)
         # For lateral control: error_x directly controls lateral movement
         self.vx__dc = KP_X * error_x / 100.0  # Right/left movement based on target position
         
@@ -366,11 +356,15 @@ class LineController(Node):
         self.wz__dc = KP_Z_W * angular_error / 10.0  # Reduce oscillation
         
         # Debug control outputs before coordinate transformation
-        self.get_logger().info(f"DC frame commands: vx={self.vx__dc:.3f}, vy={self.vy__dc:.3f}, wz={self.wz__dc:.3f}")
-        
+        logger.log("received_line", logging_framework.LoggerColors.GREEN,
+                f"Line parameters: x={x}, y={y}, vx={vx:.3f}, vy={vy:.3f}", 1000)
+        logger.log("line_sub_dc", logging_framework.LoggerColors.BLUE, 
+                f"DC frame commands: vx={self.vx__dc:.3f}, vy={self.vy__dc:.3f}, wz={self.wz__dc:.3f}", 1000)
+
         # Convert and publish velocity commands
         vx_bd, vy_bd, wz_bd = self.convert_velocity_setpoints()
-        self.get_logger().info(f"BD frame commands: vx={vx_bd:.3f}, vy={vy_bd:.3f}, wz={wz_bd:.3f}")
+        logger.log("line_sub_bd", logging_framework.LoggerColors.BLUE, 
+                f"BD frame commands: vx={vx_bd:.3f}, vy={vy_bd:.3f}, wz={wz_bd:.3f}", 1000)
         self.publish_trajectory_setpoint(vx_bd, vy_bd, wz_bd)
     
     def normalize_angle(self, angle):

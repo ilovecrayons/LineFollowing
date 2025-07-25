@@ -4,6 +4,9 @@ from sensor_msgs.msg import Image
 import cv2
 from cv_bridge import CvBridge 
 import numpy as np
+from line_follower.logger import logging_framework
+
+logger = logging_framework.Logger()
 
 def detect_white_strict(img):
     """Detect white pixels with strict thresholds"""
@@ -52,15 +55,12 @@ def process_linreg(img):
                 'slope': slope, 'intercept': intercept, 'is_vertical': bool, 'confidence': float}
                or None if no line detected
     """
-    print(f"  [LINREG] Starting simple line processing (image shape: {img.shape})")
-    
+
     # Create working copy
     result_img = img.copy()
     
     # First, let's analyze the actual image content
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    print(f"  [LINREG] Image stats: min={np.min(gray)}, max={np.max(gray)}, mean={np.mean(gray):.1f}")
-    print(f"  [LINREG] Unique values in first 10 pixels: {np.unique(gray.flatten()[:10])}")
     
     # Try multiple detection strategies
     detection_methods = [
@@ -72,19 +72,14 @@ def process_linreg(img):
     ]
     
     for method_name, method_func in detection_methods:
-        print(f"  [LINREG] Trying method: {method_name}")
         try:
             binary, valid = method_func()
             white_pixels = np.sum(binary > 0)
-            print(f"  [LINREG] Method {method_name}: {white_pixels} pixels found, valid={valid}")
             if valid:
-                print(f"  [LINREG] SUCCESS with method: {method_name}")
                 break
         except Exception as e:
-            print(f"  [LINREG] Method {method_name} failed: {e}")
             continue
     else:
-        print("  [LINREG] All detection methods failed")
         
         result_color = img.copy()
         cv2.rectangle(result_color, (5, 5), (300, 80), (0, 0, 0), -1)  # Black background
@@ -105,10 +100,8 @@ def process_linreg(img):
     # Now we have a binary mask from one of the detection methods
     # Find line points for cv2.fitLine
     points = np.argwhere(binary > 0)
-    print(f"  [LINREG] Line points found: {len(points)}")
     
     if len(points) < 10:  # Need minimum points for reliable fitting
-        print("  [LINREG] Insufficient points for line fitting")
         return result_img, None
     
     # Convert points to (x,y) format for cv2.fitLine
@@ -163,9 +156,7 @@ def process_linreg(img):
     # Add text background for better readability
     cv2.rectangle(result_color, (5, 5), (400, 160), (0, 0, 0), -1)  # Black background
     
-    print(f"  [LINREG] Visualization: center=({center_x},{center_y}), arrow_end=({end_x},{end_y})")
-    print(f"  [LINREG] Line endpoints: ({0},{lefty}) to ({cols-1},{righty})")
-    print(f"  [LINREG] Binary mask has {np.sum(binary > 0)} white pixels")
+    
     
     # Calculate slope and intercept
     if abs(vx) > 1e-6:
@@ -198,19 +189,52 @@ def process_linreg(img):
     cv2.line(result_color, (img_center_x - 30, img_center_y), (img_center_x + 30, img_center_y), (255, 255, 255), 3)
     cv2.line(result_color, (img_center_x, img_center_y - 30), (img_center_x, img_center_y + 30), (255, 255, 255), 3)
     
-    print(f"  [LINREG] Line detected: pos=({x0:.1f},{y0:.1f}), dir=({vx:.3f},{vy:.3f}), conf={confidence:.3f}")
     
-    # Prepare line info for the controller - using field names expected by detector.py
+    from line_follower.line_visualizer import create_line_following_debug_image
+    
+    # Simulate basic control calculations for visualization
+    EXTEND = 300
+    IMAGE_WIDTH = img.shape[1] 
+    IMAGE_HEIGHT = img.shape[0]
+    CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2])
+    
+    # Calculate what the control system would calculate
+    target_x = x0 + EXTEND * vx
+    target_y = y0 + EXTEND * vy
+    error_x = target_x - CENTER[0]
+    error_y = target_y - CENTER[1]
+    
+    # Simulate velocity commands (basic proportional control)
+    KP_X, KP_Y = 0.8, 0.8
+    simulated_vx_dc = KP_X * error_x / 100.0
+    base_forward_speed = 0.5
+    y_correction = -KP_Y * error_y / 200.0
+    simulated_vy_dc = -(base_forward_speed + y_correction)
+    simulated_wz_dc = 0.0  # No yaw for now
+    
+    # Create comprehensive debug visualization
+    result_color = create_line_following_debug_image(
+        image=img,
+        line_x=x0, line_y=y0, line_vx=vx, line_vy=vy,
+        vx_dc=simulated_vx_dc, vy_dc=simulated_vy_dc, wz_dc=simulated_wz_dc,
+        # Additional debug info
+        error_x=error_x,
+        error_y=error_y,
+        confidence=confidence,
+        method=method_name,
+        points_detected=len(points)
+    )
+    
+    # Prepare line info (unchanged)
     line_info = {
-        'x_position': float(x0),      # Expected by detector.py
-        'y_position': float(y0),      # Expected by detector.py
-        'direction_x': float(vx),     # Expected by detector.py for curve support
-        'direction_y': float(vy),     # Expected by detector.py for curve support
+        'x_position': float(x0),
+        'y_position': float(y0),
+        'direction_x': float(vx),
+        'direction_y': float(vy),
         'slope': float(slope),
         'intercept': float(intercept),
         'is_vertical': is_vertical,
         'confidence': confidence,
-        # Keep original names for backwards compatibility
         'x': float(x0),
         'y': float(y0), 
         'vx': float(vx),
@@ -239,18 +263,8 @@ class linreg(Node):
             # Publish result image
             ros_image_msg = bridge.cv2_to_imgmsg(result_img, encoding='bgr8')
             self.annotated_img_pub.publish(ros_image_msg)
-            
-            # Log detection results
-            if line_info:
-                self.get_logger().info(f"Line detected: pos=({line_info['x']:.1f},{line_info['y']:.1f}), "
-                                     f"dir=({line_info['vx']:.3f},{line_info['vy']:.3f})")
-            else:
-                self.get_logger().info("No line detected")
-                
-        except Exception as e:
-            self.get_logger().error(f"Error in image processing: {str(e)}")
-
-        self.get_logger().info("Callback function running")
+        except:
+            logger.log("linreg_error", logging_framework.LoggerColors.RED, "Failed to process image", 1000, force=True)
 
 
 def main(args=None):
