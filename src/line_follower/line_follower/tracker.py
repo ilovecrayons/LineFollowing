@@ -261,6 +261,7 @@ class LineController(Node):
         else:
             msg.velocity = [vx, vy, 0.0]
         msg.acceleration = [None, None, None]
+        msg.yaw = float('nan')
         msg.yawspeed = wz
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.trajectory_setpoint_publisher.publish(msg)
