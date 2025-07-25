@@ -14,7 +14,7 @@ from cv_bridge import CvBridge, CvBridgeError
 from line_interfaces.msg import Line
 import sys
 from .linreg import process_linreg
-from .logging_framework import get_logger
+from .logging_framework import Logger, LoggerColors
 
 #############
 # CONSTANTS #
@@ -32,7 +32,7 @@ class LineDetector(Node):
         super().__init__('detector')
 
         # Initialize custom logger
-        self.logger = get_logger('detector')
+        self.logger = Logger()
 
         # A subscriber to the topic '/aero_downward_camera/image'
         self.camera_sub = self.create_subscription(
@@ -83,7 +83,6 @@ class LineDetector(Node):
             self.original_width = width
             self.original_height = height
             self.original_center = (width // 2, height // 2)
-            self.logger.info("image_info", f"Original image dimensions: {width}x{height}")
         
         # Calculate new dimensions
         new_width = int(width * crop_factor)
@@ -97,7 +96,6 @@ class LineDetector(Node):
         
         # Crop the image
         cropped_img = img[start_y:end_y, start_x:end_x]
-        self.logger.debug("image_info", f"Cropped image to {new_width}x{new_height} (FOV reduced by {(1-crop_factor)*100}%)")
         
         return cropped_img
 
@@ -152,10 +150,8 @@ class LineDetector(Node):
         
         # Choose the direction with smaller angular distance
         if dist1 <= dist2:
-            self.logger.debug("curve_detection", f"Chose direction1: angular dist = {dist1:.3f} vs {dist2:.3f}")
             return direction1
         else:
-            self.logger.debug("curve_detection", f"Chose direction2: angular dist = {dist2:.3f} vs {dist1:.3f}")
             return direction2
 
     ######################
@@ -181,7 +177,6 @@ class LineDetector(Node):
             self.no_detection_count += 1
             if self.no_detection_count > self.max_no_detection:
                 # Use default line (center of cropped image) with consistent direction
-                self.get_logger().warn("Using default line after multiple detection failures")
                 default_vx, default_vy = 0.0, 1.0  # Default downward direction
                 
                 # Apply direction consistency if we have previous direction
@@ -203,7 +198,6 @@ class LineDetector(Node):
             msg.vy = float(line[3])
             # Publish param msg
             self.param_pub.publish(msg)
-            self.logger.debug("processing_steps", f"Published line: x={line[0]}, y={line[1]}, vx={line[2]}, vy={line[3]}")
 
         # Publish annotated image if DISPLAY is True and a line was detected
         if DISPLAY and line is not None:
@@ -238,13 +232,12 @@ class LineDetector(Node):
         else:
             image_bgr = image.copy()
 
-        # Process with BGR image
-        resulting_image, line_info = process_linreg(image_bgr)
+        # Process with BGR image (no heading available in detector, use default)
+        resulting_image, line_info = process_linreg(image_bgr, 0.0)
         linreg_msg = self.bridge.cv2_to_imgmsg(resulting_image, encoding='bgr8')
         linreg_msg.header = msg.header
         self.cvresult_pub.publish(linreg_msg)
         if line_info is None:
-            self.get_logger().warn("No line detected in image")
             return None
             
         # Comprehensive check for invalid line data
@@ -252,7 +245,6 @@ class LineDetector(Node):
             'slope' not in line_info or 
             'intercept' not in line_info or 
             'is_vertical' not in line_info):
-            self.get_logger().warn("Invalid line information received from line processor")
             return None
             
         # Extract values from line_info - now with enhanced curve support
@@ -270,7 +262,6 @@ class LineDetector(Node):
             x = x0
             y = y0
             
-            self.logger.debug("curve_detection", f"Using curve-fitted direction: vx={vx:.3f}, vy={vy:.3f}")
         else:
             # Fallback to traditional slope-based calculation
             if vertical:
@@ -294,7 +285,6 @@ class LineDetector(Node):
         
         # Check if any of the line parameters are NaN
         if (np.isnan(x) or np.isnan(y) or np.isnan(vx) or np.isnan(vy)):
-            self.get_logger().warn("Invalid line parameters detected (NaN values)")
             return None
         
         # Normalize direction vector
@@ -310,7 +300,6 @@ class LineDetector(Node):
         self.previous_direction = (vx, vy)
         self.detection_count += 1
         
-        self.logger.info("curve_detection", f"Detected line: x={x}, y={y}, vx={vx}, vy={vy} (detection #{self.detection_count})")
         return (x, y, vx, vy)
 
 
@@ -318,14 +307,12 @@ class LineDetector(Node):
 def main(args=None):
     rclpy.init(args=args)
     detector = LineDetector()
-    system_logger = get_logger('system')
-    system_logger.system("startup", "Line detector initialized")
     try:
         rclpy.spin(detector)
     except KeyboardInterrupt:
-        system_logger.system("startup", "Shutting down")
+        pass
     except Exception as e:
-        system_logger.error("errors", str(e))
+        pass
     finally:
         detector.destroy_node()
         rclpy.shutdown()

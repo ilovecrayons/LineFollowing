@@ -8,7 +8,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus
 from line_interfaces.msg import Line
 import tf_transformations as tft
-from .logging_framework import get_logger
+from .logging_framework import Logger, LoggerColors
 
 #############
 # CONSTANTS #
@@ -23,8 +23,11 @@ CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2]) # Center of the image frame
 EXTEND = 300 # Number of pixels forward to extrapolate the line
 KP_X = 0.8    # Increased for more responsive lateral control
 KP_Y = 0.8    # Increased for more responsive forward/backward control
-KP_Z_W = 2.0  # Reduced to prevent oscillation
+KP_Z_W = 10  # Reduced to prevent oscillation
 DISPLAY = True
+
+# Control flags
+ENABLE_HORIZONTAL_VELOCITY = False  # Set to True to enable vx and vy output
 
 #########################
 # COORDINATE TRANSFORMS #
@@ -164,8 +167,7 @@ class LineController(Node):
     def __init__(self) -> None:
         super().__init__('line_controller')
 
-        # Initialize custom logger
-        self.logger = get_logger('tracker')
+        self.logger = Logger()
 
         # Create CoordTransforms instance
         self.coord_transforms = CoordTransforms()
@@ -217,6 +219,29 @@ class LineController(Node):
     def vehicle_local_position_callback(self, vehicle_local_position):
         """Callback function for vehicle_local_position topic subscriber."""
         self.vehicle_local_position = vehicle_local_position
+        
+    def get_current_heading(self):
+        """
+        Extract current heading (yaw) from vehicle local position quaternion.
+        Returns heading in radians (-pi to pi).
+        """
+        try:
+            # Extract quaternion from vehicle local position
+            q = [
+                self.vehicle_local_position.q[1],  # x
+                self.vehicle_local_position.q[2],  # y  
+                self.vehicle_local_position.q[3],  # z
+                self.vehicle_local_position.q[0]   # w (PX4 uses w-first format, tf uses w-last)
+            ]
+            
+            # Convert quaternion to euler angles
+            euler = tft.euler_from_quaternion(q)
+            yaw = euler[2]  # Yaw is the third component (roll, pitch, yaw)
+            
+            return yaw
+        except (AttributeError, IndexError):
+            # Return 0 if quaternion data is not available yet
+            return 0.0
 
     def vehicle_status_callback(self, vehicle_status):
         """Callback function for vehicle_status topic subscriber."""
@@ -226,24 +251,24 @@ class LineController(Node):
         """Send an arm command to the vehicle."""
         self.publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
-        self.logger.system('system_events', 'Arm command sent')
+        self.logger.log('system_events', LoggerColors.GREEN, 'Arm command sent', 1000)
 
     def disarm(self):
         """Send a disarm command to the vehicle."""
         self.publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
-        self.logger.system('system_events', 'Disarm command sent')
+        self.logger.log('system_events', LoggerColors.RED, 'Disarm command sent', 1000)
 
     def engage_offboard_mode(self):
         """Switch to offboard mode."""
         self.publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
-        self.logger.system('system_events', "Switching to offboard mode")
+        self.logger.log('system_events', LoggerColors.YELLOW, "Switching to offboard mode", 1000)
 
     def land(self):
         """Switch to land mode."""
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
-        self.logger.system('system_events', "Switching to land mode")
+        self.logger.log('system_events', LoggerColors.YELLOW, "Switching to land mode", 1000)
 
     def publish_offboard_control_heartbeat_signal(self):
         """Publish the offboard control mode."""
@@ -251,7 +276,7 @@ class LineController(Node):
         msg.position = True
         msg.velocity = True
         msg.acceleration = False
-        msg.attitude = False
+        msg.attitude = True
         msg.body_rate = True
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.offboard_control_mode_publisher.publish(msg)
@@ -265,10 +290,15 @@ class LineController(Node):
         else:
             msg.velocity = [vx, vy, 0.0]
         msg.acceleration = [None, None, None]
+        msg.yaw = float('nan')
         msg.yawspeed = wz
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.trajectory_setpoint_publisher.publish(msg)
-        self.logger.debug('velocity_commands', f"Publishing velocity setpoints {[vx, vy, wz]}")
+        
+        # Get current heading for logging
+        current_heading = self.get_current_heading()
+        current_heading_deg = math.degrees(current_heading)
+        
 
     def publish_vehicle_command(self, command, **params) -> None:
         """Publish a vehicle command."""
@@ -290,16 +320,14 @@ class LineController(Node):
         self.vehicle_command_publisher.publish(msg)
 
     def convert_velocity_setpoints(self):
-        # Debug input values
-        self.logger.debug('coordinate_transform', f"Converting DC velocities: vx={self.vx__dc:.3f}, vy={self.vy__dc:.3f}, wz={self.wz__dc:.3f}")
-        
+
         # Set linear velocity (convert command velocity from downward camera frame to bd frame)
         vx, vy, vz = self.coord_transforms.static_transform((self.vx__dc, self.vy__dc, self.vz__dc), 'dc', 'bd')
 
         # Set angular velocity (convert command angular velocity from downward camera to bd frame)
         _, _, wz = self.coord_transforms.static_transform((0.0, 0.0, self.wz__dc), 'dc', 'bd')
 
-        self.logger.debug('coordinate_transform', f"After coordinate transform: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
+        self.logger.log('coordinate_transform', LoggerColors.BLUE, f"After coordinate transform: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}", 1000)
 
         # enforce safe velocity limits
         if _MAX_SPEED < 0.0 or _MAX_CLIMB_RATE < 0.0 or _MAX_ROTATION_RATE < 0.0:
@@ -308,7 +336,6 @@ class LineController(Node):
         vy = min(max(vy,-_MAX_SPEED), _MAX_SPEED)
         wz = min(max(wz,-_MAX_ROTATION_RATE), _MAX_ROTATION_RATE)
 
-        self.logger.debug('velocity_commands', f"After velocity limits: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
         return (vx, vy, wz)
     
     def timer_callback(self) -> None:
@@ -332,7 +359,6 @@ class LineController(Node):
             Args:
                 - param: parameters that define the center and direction of detected line
         """
-        self.logger.info("line_detection", "Line detected, following line")
         # Extract line parameters
         x, y, vx, vy = param.x, param.y, param.vx, param.vy
         
@@ -350,31 +376,77 @@ class LineController(Node):
         error_x = target_x - CENTER[0]
         error_y = target_y - CENTER[1]
         
-        # Debug info - show what we received
-        self.logger.debug("line_detection", f"Line at ({x:.1f}, {y:.1f}), direction ({vx:.2f}, {vy:.2f})")
-        self.logger.debug("line_detection", f"Target at ({target_x:.1f}, {target_y:.1f}), errors ({error_x:.1f}, {error_y:.1f})")
         
-        # SIMPLIFIED CONTROL LOGIC - direct proportional control
-        # For lateral control: error_x directly controls lateral movement
         self.vx__dc = KP_X * error_x / 100.0  # Right/left movement based on target position
-        
-        # For forward movement: always move forward, adjust based on y error
-        base_forward_speed = 0.5  # Constant forward movement
-        y_correction = -KP_Y * error_y / 200.0  # Adjust forward speed based on line position
-        self.vy__dc = -(base_forward_speed + y_correction)  # Negative for forward in dc frame
+
+        self.vy__dc = -KP_Y * error_y / 100.0
+        # Get current heading of the drone
+
+        current_heading = self.get_current_heading()
         
         # For heading control: align with line direction
-        desired_heading = np.arctan2(vx, -vy)  # Calculate desired heading from line direction
-        angular_error = self.normalize_angle(desired_heading)
-        self.wz__dc = KP_Z_W * angular_error / 10.0  # Reduce oscillation
+        vx_bd, vy_bd, _ = self.coord_transforms.static_transform((vx, vy, 0.0), 'dc', 'bd')
         
-        # Debug control outputs before coordinate transformation
-        self.logger.debug("control_loops", f"DC frame commands: vx={self.vx__dc:.3f}, vy={self.vy__dc:.3f}, wz={self.wz__dc:.3f}")
+        # Calculate desired heading in body frame - add 90° to correct offset
+        desired_heading = np.arctan2(vy_bd, vx_bd) + np.pi/2
+        
+        # Calculate true angular error (difference between desired and current heading)
+        angular_error = self.normalize_angle(desired_heading - current_heading)
+        
+        # MODIFIED: Track yaw rate changes over time to verify control effectiveness
+        prev_wz_value = getattr(self, '_prev_wz_value', 0.0)
+        prev_heading = getattr(self, '_prev_heading', current_heading)
+        heading_change = self.normalize_angle(current_heading - prev_heading)
+        
+        # Calculate yaw rate with enhanced logging
+        self.wz__dc = KP_Z_W * angular_error
+        
+        # Store for next iteration
+        self._prev_wz_value = self.wz__dc
+        self._prev_heading = current_heading
+        
+        # Log both the raw line direction and transformed direction for debugging
+        self.logger.log("heading_control", LoggerColors.CYAN, 
+                         f"Line direction in camera frame: ({vx:.2f}, {vy:.2f}), "
+                         f"transformed to body frame: ({vx_bd:.2f}, {vy_bd:.2f})", 1000)
+        
+        # MODIFIED: Add enhanced heading tracking log
+        self.logger.log("heading_tracking", LoggerColors.GREEN,
+                        f"Heading control: current={math.degrees(current_heading):.1f}° "
+                        f"desired={math.degrees(desired_heading):.1f}° "
+                        f"error={math.degrees(angular_error):.1f}° "
+                        f"change={math.degrees(heading_change):.3f}°/cycle "
+                        f"wz_cmd={self.wz__dc:.3f}", 1000)
         
         # Convert and publish velocity commands
         vx_bd, vy_bd, wz_bd = self.convert_velocity_setpoints()
-        self.logger.debug("control_loops", f"BD frame commands: vx={vx_bd:.3f}, vy={vy_bd:.3f}, wz={wz_bd:.3f}")
-        self.publish_trajectory_setpoint(vx_bd, vy_bd, wz_bd)
+        
+        # Conditional velocity output based on control flag
+        if ENABLE_HORIZONTAL_VELOCITY:
+            actual_vx, actual_vy, actual_wz = vx_bd, vy_bd, wz_bd
+            control_mode = "FULL CONTROL"
+        else:
+            actual_vx, actual_vy, actual_wz = 0.0, 0.0, wz_bd
+            control_mode = "YAW ONLY"
+        
+        # Get current heading for final logging
+        current_heading_deg = math.degrees(current_heading)
+        desired_heading_deg = math.degrees(desired_heading)
+        angular_error_deg = math.degrees(angular_error)
+        
+        # Single comprehensive velocity log message - force=True to bypass rate limiting
+        velocity_message = (f"VELOCITY CONTROL [{control_mode}] | "
+                        f"Errors: x={error_x:.0f}px y={error_y:.0f}px | "
+                        f"Heading: curr={current_heading_deg:.0f}° des={desired_heading_deg:.0f}° err={angular_error_deg:.0f}° | "
+                        f"TARGET: vx={vx_bd:.3f} vy={vy_bd:.3f} yaw={wz_bd:.3f} | "
+                        f"OUTPUT: vx={actual_vx:.3f} vy={actual_vy:.3f} yaw={actual_wz:.3f}")
+        
+        # Log with force=True to bypass rate limiting
+        self.logger.log("velocity_commands", LoggerColors.MAGENTA, velocity_message, 1000)
+
+        
+        # Publish the actual values
+        self.publish_trajectory_setpoint(actual_vx, actual_vy, actual_wz)
     
     def normalize_angle(self, angle):
         """Normalize angle to be between -pi and pi"""
@@ -385,8 +457,7 @@ class LineController(Node):
         return angle
 
 def main(args=None) -> None:
-    logger = get_logger('system')
-    logger.system('startup', 'Starting offboard control node...')
+    
     rclpy.init(args=args)
     offboard_control = LineController()
     rclpy.spin(offboard_control)
@@ -395,8 +466,5 @@ def main(args=None) -> None:
 
 
 if __name__ == '__main__':
-    try:
-        main()
-    except Exception as e:
-        logger = get_logger('system')
-        logger.error('errors', str(e))
+    main()
+    

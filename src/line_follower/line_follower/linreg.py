@@ -1,13 +1,25 @@
 import rclpy
 from rclpy.node import Node 
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image
+from px4_msgs.msg import VehicleLocalPosition
 import cv2
 from cv_bridge import CvBridge 
 import numpy as np
-from .logging_framework import get_logger
+import math
+import tf_transformations as tft
+from .logging_framework import Logger, LoggerColors
 
 # Initialize component logger
-logger = get_logger('linreg')
+logger = Logger()
+
+def normalize_angle(angle):
+    """Normalize angle to be between -pi and pi"""
+    while angle > np.pi:
+        angle -= 2 * np.pi
+    while angle < -np.pi:
+        angle += 2 * np.pi
+    return angle
 
 def detect_white_strict(img):
     """Detect white pixels with strict thresholds"""
@@ -45,26 +57,24 @@ def detect_color_edges(img):
     mask = cv2.dilate(edges, kernel, iterations=2)
     return mask, np.sum(mask > 0) > 100
 
-def process_linreg(img):
+def process_linreg(img, current_heading=0.0):
     """
     Simple line detection using OpenCV fitLine.
     Args:
         img: Input image (BGR format)
+        current_heading: Current drone heading in radians for visualization
     Returns:
         tuple: (display_img, line_info) where line_info contains:
                {'x': x_position, 'y': y_position, 'vx': direction_x, 'vy': direction_y, 
                 'slope': slope, 'intercept': intercept, 'is_vertical': bool, 'confidence': float}
                or None if no line detected
     """
-    logger.debug("processing_details", f"Starting simple line processing (image shape: {img.shape})")
     
     # Create working copy
     result_img = img.copy()
     
     # First, let's analyze the actual image content
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    logger.debug("pixel_analysis", f"Image stats: min={np.min(gray)}, max={np.max(gray)}, mean={np.mean(gray):.1f}")
-    logger.debug("pixel_analysis", f"Unique values in first 10 pixels: {np.unique(gray.flatten()[:10])}")
     
     # Try multiple detection strategies
     detection_methods = [
@@ -76,19 +86,15 @@ def process_linreg(img):
     ]
     
     for method_name, method_func in detection_methods:
-        logger.debug("method_attempts", f"Trying method: {method_name}")
         try:
             binary, valid = method_func()
             white_pixels = np.sum(binary > 0)
-            logger.debug("method_attempts", f"Method {method_name}: {white_pixels} pixels found, valid={valid}")
+            
             if valid:
-                logger.debug("method_attempts", f"SUCCESS with method: {method_name}")
                 break
         except Exception as e:
-            logger.debug("method_attempts", f"Method {method_name} failed: {e}")
             continue
     else:
-        logger.info("detection_events", "All detection methods failed")
         
         result_color = img.copy()
         cv2.rectangle(result_color, (5, 5), (300, 80), (0, 0, 0), -1)  # Black background
@@ -109,10 +115,10 @@ def process_linreg(img):
     # Now we have a binary mask from one of the detection methods
     # Find line points for cv2.fitLine
     points = np.argwhere(binary > 0)
-    logger.debug("processing_details", f"Line points found: {len(points)}")
+    # logger.debug("processing_details", f"Line points found: {len(points)}")
     
     if len(points) < 10:  # Need minimum points for reliable fitting
-        logger.info("detection_events", "Insufficient points for line fitting")
+        # logger.info("detection_events", "Insufficient points for line fitting")
         return result_img, None
     
     # Convert points to (x,y) format for cv2.fitLine
@@ -122,8 +128,26 @@ def process_linreg(img):
     line_fit = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
     vx, vy, x0, y0 = line_fit.flatten()  # extract scalars from numpy arrays
     
+    # Calculate desired heading from line direction (same formula as in tracker.py)
+    desired_heading = np.arctan2(vx, -vy)
+    # Calculate angular error
+    angular_error = normalize_angle(desired_heading - current_heading)
+    
     # Calculate line parameters
     rows, cols = binary.shape
+    
+    # Calculate slope, intercept, and vertical flag
+    if abs(vx) > 1e-6:  # Not vertical
+        slope = vy / vx
+        intercept = y0 - slope * x0
+        is_vertical = False
+    else:  # Vertical line
+        slope = float('inf')
+        intercept = x0  # For vertical lines, store x-intercept
+        is_vertical = True
+    
+    # Calculate confidence based on number of points and line fit quality
+    confidence = min(1.0, len(points) / 500.0)  # Normalize by expected max points
     
     # Calculate line endpoints for visualization
     lefty = int((-x0 * vy / vx) + y0) if vx != 0 else 0
@@ -164,25 +188,40 @@ def process_linreg(img):
     end_y = int(center_y + arrow_length * vy)
     cv2.arrowedLine(result_color, (center_x, center_y), (end_x, end_y), (0, 255, 255), 6)  # Cyan arrow (thicker)
     
+    # Add target point visualization (EXTEND pixels ahead along the line)
+    EXTEND = 300  # Same as in tracker.py
+    target_x = int(center_x + EXTEND * vx)
+    target_y = int(center_y + EXTEND * vy)
+    
+    # Draw target point if it's within image bounds
+    if 0 <= target_x < cols and 0 <= target_y < rows:
+        cv2.circle(result_color, (target_x, target_y), 20, (0, 255, 0), -1)  # Green target point
+        cv2.circle(result_color, (target_x, target_y), 20, (255, 255, 255), 3)  # White border for visibility
+        
+        # Draw line from center to target
+        cv2.line(result_color, (center_x, center_y), (target_x, target_y), (0, 255, 0), 3)  # Green line to target
+    
+    # Add image center indicator (where drone currently is)
+    img_center_x = cols // 2
+    img_center_y = rows // 2
+    cv2.circle(result_color, (img_center_x, img_center_y), 12, (255, 255, 0), -1)  # Yellow drone position
+    cv2.circle(result_color, (img_center_x, img_center_y), 12, (0, 0, 0), 2)  # Black border
+    
+    # Draw heading indicators using actual drone heading and desired heading
+    heading_length = 80
+    
+    # Current heading (blue)
+    heading_end_x = int(img_center_x + heading_length * math.sin(current_heading))
+    heading_end_y = int(img_center_y - heading_length * math.cos(current_heading))
+    cv2.arrowedLine(result_color, (img_center_x, img_center_y), (heading_end_x, heading_end_y), (255, 0, 0), 4)  # Blue current heading
+    
+    # Desired heading (red)
+    desired_end_x = int(img_center_x + heading_length * math.sin(desired_heading))
+    desired_end_y = int(img_center_y - heading_length * math.cos(desired_heading))
+    cv2.arrowedLine(result_color, (img_center_x, img_center_y), (desired_end_x, desired_end_y), (0, 0, 255), 4)  # Red desired heading
+    
     # Add text background for better readability
-    cv2.rectangle(result_color, (5, 5), (400, 160), (0, 0, 0), -1)  # Black background
-    
-    logger.debug("visualization_info", f"Visualization: center=({center_x},{center_y}), arrow_end=({end_x},{end_y})")
-    logger.debug("visualization_info", f"Line endpoints: ({0},{lefty}) to ({cols-1},{righty})")
-    logger.debug("visualization_info", f"Binary mask has {np.sum(binary > 0)} white pixels")
-    
-    # Calculate slope and intercept
-    if abs(vx) > 1e-6:
-        slope = vy / vx
-        intercept = y0 - slope * x0
-        is_vertical = False
-    else:
-        slope = np.inf
-        intercept = np.nan
-        is_vertical = True
-    
-    # Calculate confidence based on number of inlier points
-    confidence = min(1.0, len(points) / 1000.0)  # Simple confidence metric
+    cv2.rectangle(result_color, (5, 5), (400, 250), (0, 0, 0), -1)  # Black background (made taller)
     
     # Add comprehensive debug info to visualization with better visibility
     cv2.putText(result_color, f"Confidence: {confidence:.3f}", (10, 30), 
@@ -191,18 +230,30 @@ def process_linreg(img):
                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     cv2.putText(result_color, f"Direction: ({vx:.3f}, {vy:.3f})", (10, 90), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.putText(result_color, f"Points: {len(points)}", (10, 120), 
+    cv2.putText(result_color, f"Target: ({target_x}, {target_y})", (10, 120), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.putText(result_color, f"Method: {method_name}", (10, 150), 
+    cv2.putText(result_color, f"Points: {len(points)}", (10, 150), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(result_color, f"Method: {method_name}", (10, 180), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     
-    # Add image center crosshair for reference (bright white)
-    img_center_x = cols // 2
-    img_center_y = rows // 2
-    cv2.line(result_color, (img_center_x - 30, img_center_y), (img_center_x + 30, img_center_y), (255, 255, 255), 3)
-    cv2.line(result_color, (img_center_x, img_center_y - 30), (img_center_x, img_center_y + 30), (255, 255, 255), 3)
+    # Display headings and error information
+    heading_deg = math.degrees(current_heading)
+    desired_heading_deg = math.degrees(desired_heading)
+    angular_error_deg = math.degrees(angular_error)
     
-    logger.info("detection_events", f"Line detected: pos=({x0:.1f},{y0:.1f}), dir=({vx:.3f},{vy:.3f}), conf={confidence:.3f}")
+    cv2.putText(result_color, f"Current: {heading_deg:.1f}°", (10, 210), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2)  # Blue text for current heading
+    cv2.putText(result_color, f"Desired: {desired_heading_deg:.1f}°", (170, 210), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2)  # Red text for desired heading
+    cv2.putText(result_color, f"Error: {angular_error_deg:.1f}°", (330, 210), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 100), 2)  # Green text for error
+    
+    # Add legend for heading arrows
+    cv2.putText(result_color, "Blue: Current | Red: Desired", (10, 240), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    # logger.info("detection_events", f"Line detected: pos=({x0:.1f},{y0:.1f}), dir=({vx:.3f},{vy:.3f}), conf={confidence:.3f}")
     
     # Prepare line info for the controller - using field names expected by detector.py
     line_info = {
@@ -227,35 +278,76 @@ def process_linreg(img):
 class linreg(Node):
     def __init__(self):
         super().__init__('linreg_test')
-        self.logger = get_logger('linreg')
-        self.logger.system("startup", "Simple Line Regression Node Started")
+        # self.logger = get_logger('linreg')
+        # self.logger.system("startup", "Simple Line Regression Node Started")
+        
+        # Configure QoS profile for PX4 messages
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        
+        # Store current heading for visualization
+        self.current_heading = 0.0
+        self.vehicle_local_position = None
 
         self.image_sub = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
         self.annotated_img_pub = self.create_publisher(Image, 'final_image', 10)
+        
+        # Subscribe to vehicle position to get current heading
+        self.vehicle_local_position_subscriber = self.create_subscription(
+            VehicleLocalPosition, '/fmu/out/vehicle_local_position', self.vehicle_local_position_callback, qos_profile)
+            
+    def vehicle_local_position_callback(self, vehicle_local_position):
+        """Callback function for vehicle_local_position topic subscriber."""
+        self.vehicle_local_position = vehicle_local_position
+        self.current_heading = self.get_current_heading()
+        
+    def get_current_heading(self):
+        """
+        Extract current heading (yaw) from vehicle local position quaternion.
+        Returns heading in radians (-pi to pi).
+        """
+        if self.vehicle_local_position is None:
+            return 0.0
+            
+        try:
+            # Extract quaternion from vehicle local position
+            q = [
+                self.vehicle_local_position.q[1],  # x
+                self.vehicle_local_position.q[2],  # y  
+                self.vehicle_local_position.q[3],  # z
+                self.vehicle_local_position.q[0]   # w (PX4 uses w-first format, tf uses w-last)
+            ]
+            
+            # Convert quaternion to euler angles
+            euler = tft.euler_from_quaternion(q)
+            yaw = euler[2]  # Yaw is the third component (roll, pitch, yaw)
+            
+            return yaw
+        except (AttributeError, IndexError):
+            # Return 0 if quaternion data is not available yet
+            return 0.0
 
     def image_callback(self, msg):
         bridge = CvBridge()
         try:
             cv_image = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             
-            # Process line detection
-            result_img, line_info = process_linreg(cv_image)
+            # Process line detection with current heading
+            result_img, line_info = process_linreg(cv_image, self.current_heading)
             
             # Publish result image
             ros_image_msg = bridge.cv2_to_imgmsg(result_img, encoding='bgr8')
             self.annotated_img_pub.publish(ros_image_msg)
             
-            # Log detection results
-            if line_info:
-                self.logger.info("detection_events", f"Line detected: pos=({line_info['x']:.1f},{line_info['y']:.1f}), "
-                                     f"dir=({line_info['vx']:.3f},{line_info['vy']:.3f})")
-            else:
-                self.logger.info("detection_events", "No line detected")
-                
         except Exception as e:
-            self.logger.error("errors", f"Error in image processing: {str(e)}")
+            pass
+            # self.logger.error("errors", f"Error in image processing: {str(e)}")
 
-        self.logger.debug("processing_details", "Callback function running")
+        # self.logger.debug("processing_details", "Callback function running")
 
 
 def main(args=None):
