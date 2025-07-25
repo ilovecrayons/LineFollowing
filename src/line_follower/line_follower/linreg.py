@@ -128,8 +128,16 @@ def process_linreg(img, current_heading=0.0):
     line_fit = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
     vx, vy, x0, y0 = line_fit.flatten()  # extract scalars from numpy arrays
     
+    # CHANGED: Ensure consistent direction - prefer NEGATIVE y direction (upward in image)
+    # This matches the updated direction convention in detector.py
+    if vy > 0:  # If pointing downward
+        vx = -vx
+        vy = -vy  # Flip to point upward
+    
     # Calculate desired heading from line direction (same formula as in tracker.py)
-    desired_heading = np.arctan2(vx, -vy)
+    vx_bd, vy_bd = vx, -vy  # Approximation of camera-to-body transform for visualization
+    desired_heading = np.arctan2(vx_bd, vy_bd)  # This matches tracker.py's calculation
+    
     # Calculate angular error
     angular_error = normalize_angle(desired_heading - current_heading)
     
@@ -182,11 +190,18 @@ def process_linreg(img, current_heading=0.0):
     center_y = int(y0)
     cv2.circle(result_color, (center_x, center_y), 15, (255, 0, 255), -1)  # Magenta center point (larger)
     
-    # Draw direction arrow
+    # Draw direction arrow - highlighting the ACTUAL direction that will be used
     arrow_length = 100
     end_x = int(center_x + arrow_length * vx)
     end_y = int(center_y + arrow_length * vy)
     cv2.arrowedLine(result_color, (center_x, center_y), (end_x, end_y), (0, 255, 255), 6)  # Cyan arrow (thicker)
+    
+    # Add a marker to explicitly show the "forward" direction
+    forward_x = int(center_x + 130 * vx)
+    forward_y = int(center_y + 130 * vy)
+    cv2.circle(result_color, (forward_x, forward_y), 12, (255, 0, 255), -1)  # Purple circle indicating "forward"
+    cv2.putText(result_color, "FWD", (forward_x + 5, forward_y + 5), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)  # Label the forward direction
     
     # Add target point visualization (EXTEND pixels ahead along the line)
     EXTEND = 300  # Same as in tracker.py
@@ -221,7 +236,7 @@ def process_linreg(img, current_heading=0.0):
     cv2.arrowedLine(result_color, (img_center_x, img_center_y), (desired_end_x, desired_end_y), (0, 0, 255), 4)  # Red desired heading
     
     # Add text background for better readability
-    cv2.rectangle(result_color, (5, 5), (400, 250), (0, 0, 0), -1)  # Black background (made taller)
+    cv2.rectangle(result_color, (5, 5), (400, 280), (0, 0, 0), -1)  # Black background (made taller)
     
     # Add comprehensive debug info to visualization with better visibility
     cv2.putText(result_color, f"Confidence: {confidence:.3f}", (10, 30), 
@@ -249,8 +264,12 @@ def process_linreg(img, current_heading=0.0):
     cv2.putText(result_color, f"Error: {angular_error_deg:.1f}°", (330, 210), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 100), 2)  # Green text for error
     
+    # CHANGED: Update direction convention info in visualization
+    cv2.putText(result_color, "Direction Priority: -Y (upward)", (10, 240), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
     # Add legend for heading arrows
-    cv2.putText(result_color, "Blue: Current | Red: Desired", (10, 240), 
+    cv2.putText(result_color, "Blue: Current | Red: Desired | Cyan: Line", (10, 270), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
     # logger.info("detection_events", f"Line detected: pos=({x0:.1f},{y0:.1f}), dir=({vx:.3f},{vy:.3f}), conf={confidence:.3f}")

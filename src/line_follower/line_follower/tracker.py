@@ -21,8 +21,8 @@ IMAGE_HEIGHT = 576  # Updated to match actual cropped image dimensions
 IMAGE_WIDTH = 768   # Updated to match actual cropped image dimensions
 CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2]) # Center of the image frame. We will treat this as the center of mass of the drone
 EXTEND = 300 # Number of pixels forward to extrapolate the line
-KP_X = 0.8    # Increased for more responsive lateral control
-KP_Y = 0.8    # Increased for more responsive forward/backward control
+KP_X = 0.5    # Increased for more responsive lateral control
+KP_Y = 0.5    # Increased for more responsive forward/backward control
 KP_Z_W = 1.5  # Reduced to prevent oscillation
 DISPLAY = True
 
@@ -320,21 +320,30 @@ class LineController(Node):
         self.vehicle_command_publisher.publish(msg)
 
     def convert_velocity_setpoints(self):
-
-        # Set linear velocity (convert command velocity from downward camera frame to bd frame)
+        """
+        Convert velocity setpoints from downward camera frame to body down frame.
+        With upward direction priority, velocity commands must be adjusted accordingly.
+        Returns: Tuple (vx_bd, vy_bd, wz_bd) of velocity commands in body down frame
+        """
+        # Transform velocities from camera to body frame
         vx, vy, vz = self.coord_transforms.static_transform((self.vx__dc, self.vy__dc, self.vz__dc), 'dc', 'bd')
 
         # Set angular velocity (convert command angular velocity from downward camera to bd frame)
         _, _, wz = self.coord_transforms.static_transform((0.0, 0.0, self.wz__dc), 'dc', 'bd')
 
-        self.logger.log('coordinate_transform', LoggerColors.BLUE, f"After coordinate transform: vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}", 1000)
+        # Log the transformation for debugging
+        self.logger.log('coordinate_transform', LoggerColors.BLUE, 
+                       f"Camera frame velocities: vx_dc={self.vx__dc:.3f}, vy_dc={self.vy__dc:.3f}, wz_dc={self.wz__dc:.3f}", 1000)
+        self.logger.log('coordinate_transform', LoggerColors.BLUE, 
+                       f"Body frame velocities: vx_bd={vx:.3f}, vy_bd={vy:.3f}, wz_bd={wz:.3f}", 1000)
 
-        # enforce safe velocity limits
+        # Enforce safe velocity limits
         if _MAX_SPEED < 0.0 or _MAX_CLIMB_RATE < 0.0 or _MAX_ROTATION_RATE < 0.0:
             raise Exception("_MAX_SPEED,_MAX_CLIMB_RATE, and _MAX_ROTATION_RATE must be positive")
-        vx = min(max(vx,-_MAX_SPEED), _MAX_SPEED)
-        vy = min(max(vy,-_MAX_SPEED), _MAX_SPEED)
-        wz = min(max(wz,-_MAX_ROTATION_RATE), _MAX_ROTATION_RATE)
+        
+        vx = min(max(vx, -_MAX_SPEED), _MAX_SPEED)
+        vy = min(max(vy, -_MAX_SPEED), _MAX_SPEED)
+        wz = min(max(wz, -_MAX_ROTATION_RATE), _MAX_ROTATION_RATE)
 
         return (vx, vy, wz)
     
@@ -376,22 +385,37 @@ class LineController(Node):
         error_x = target_x - CENTER[0]
         error_y = target_y - CENTER[1]
         
-        
-        self.vx__dc = KP_X * error_x / 100.0  # Right/left movement based on target position
-
-        self.vy__dc = -KP_Y * error_y / 100.0
         # Get current heading of the drone
-
         current_heading = self.get_current_heading()
         
         # For heading control: align with line direction
         vx_bd, vy_bd, _ = self.coord_transforms.static_transform((vx, vy, 0.0), 'dc', 'bd')
         
-        # Calculate desired heading in body frame - FIXED: removed the π/2 offset
+        # Calculate desired heading in body frame
         desired_heading = np.arctan2(vy_bd, vx_bd)
         
-        # Calculate true angular error (difference between desired and current heading)
+        # Calculate angular error (difference between desired and current heading)
         angular_error = self.normalize_angle(desired_heading - current_heading)
+        
+        # COMPLETELY SIMPLIFIED: Clear, direct velocity calculation
+        # Set a constant forward speed along the direction of the line
+        forward_speed = 0.3  # Moderate speed for stability
+        
+        # Apply directional control in camera frame
+        self.vx__dc = forward_speed * vx     # Forward component along line x direction
+        self.vy__dc = forward_speed * vy     # Forward component along line y direction
+        
+        # Add proportional correction to stay centered on the line
+        # Note how we swap X and Y and apply different signs to account for the camera orientation
+        correction_scale = 0.005  # Reduced scale factor for gentler corrections
+        self.vx__dc += -correction_scale * error_y  # Y error affects X velocity in camera frame
+        self.vy__dc += correction_scale * error_x   # X error affects Y velocity in camera frame
+        
+        # Log error values and velocities for debugging
+        self.logger.log("position_error", LoggerColors.CYAN, 
+                       f"Errors: x={error_x:.1f}px y={error_y:.1f}px | " +
+                       f"Velocities: vx_dc={self.vx__dc:.3f}, vy_dc={self.vy__dc:.3f}", 
+                       1000, force=True)  # Force log to see all values
         
         # MODIFIED: Track yaw rate changes over time to verify control effectiveness
         prev_wz_value = getattr(self, '_prev_wz_value', 0.0)
@@ -432,7 +456,7 @@ class LineController(Node):
         # Get current heading for final logging
         current_heading_deg = math.degrees(current_heading)
         desired_heading_deg = math.degrees(desired_heading)
-        angular_error_deg = math.degrees(angular_error)
+        angular_error_deg = math.degrees(angular_error);
         
         # Single comprehensive velocity log message - force=True to bypass rate limiting
         velocity_message = (f"VELOCITY CONTROL [{control_mode}] | "
@@ -465,5 +489,39 @@ def main(args=None) -> None:
     rclpy.shutdown()
 
 
+if __name__ == '__main__':
+    main()
+if __name__ == '__main__':
+    main()
+                        f"Heading: curr={current_heading_deg:.0f}° des={desired_heading_deg:.0f}° err={angular_error_deg:.0f}° | "
+                        f"TARGET: vx={vx_bd:.3f} vy={vy_bd:.3f} yaw={wz_bd:.3f} | "
+                        f"OUTPUT: vx={actual_vx:.3f} vy={actual_vy:.3f} yaw={actual_wz:.3f}")
+        
+        # Log with force=True to bypass rate limiting
+        self.logger.log("velocity_commands", LoggerColors.MAGENTA, velocity_message, 1000)
+
+        
+        # Publish the actual values
+        self.publish_trajectory_setpoint(actual_vx, actual_vy, actual_wz)
+    
+    def normalize_angle(self, angle):
+        """Normalize angle to be between -pi and pi"""
+        while angle > np.pi:
+            angle -= 2 * np.pi
+        while angle < -np.pi:
+            angle += 2 * np.pi
+        return angle
+
+def main(args=None) -> None:
+    
+    rclpy.init(args=args)
+    offboard_control = LineController()
+    rclpy.spin(offboard_control)
+    offboard_control.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
 if __name__ == '__main__':
     main()

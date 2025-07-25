@@ -134,25 +134,50 @@ class LineDetector(Node):
         Returns:
             (vx, vy) tuple with consistent direction
         """
-        # For the first few detections or if no previous direction, use downward preference
+        # Normalize input direction vector
+        norm = np.sqrt(vx**2 + vy**2)
+        if norm > 0:
+            vx = vx / norm
+            vy = vy / norm
+
+        # For the first few detections or if no previous direction
         if self.previous_direction is None or self.detection_count < 3:
-            # Default behavior: prefer downward direction in image
-            if vy < 0:
-                return (-vx, -vy)
-            return (vx, vy)
+            # CHANGED: Default behavior now prefers NEGATIVE y direction (upward in image)
+            if vy > 0:  # If pointing downward
+                return (-vx, -vy)  # Flip to point upward
+            return (vx, vy)  # Already pointing upward, keep as is
         
-        # Calculate angular distances for both possible directions
-        direction1 = (vx, vy)
-        direction2 = (-vx, -vy)
+        # After initial detections, prioritize gradual changes in direction
+        # This prevents the drone from suddenly reversing direction
+        prev_vx, prev_vy = self.previous_direction
         
-        dist1 = self.calculate_angular_distance(direction1, self.previous_direction)
-        dist2 = self.calculate_angular_distance(direction2, self.previous_direction)
+        # Calculate dot product to determine if directions are similar
+        dot_product = vx * prev_vx + vy * prev_vy
         
-        # Choose the direction with smaller angular distance
-        if dist1 <= dist2:
-            return direction1
-        else:
-            return direction2
+        # If dot product is negative, the vectors point in opposite directions
+        # Flip the current vector to maintain consistency
+        if dot_product < 0:
+            vx = -vx
+            vy = -vy
+            
+        # Update previous direction with a weighted average to allow gradual changes
+        # This creates smoother transitions when the line curves
+        alpha = 0.8  # Weight for previous direction (higher = more smoothing)
+        new_vx = alpha * prev_vx + (1-alpha) * vx
+        new_vy = alpha * prev_vy + (1-alpha) * vy
+        
+        # Renormalize the weighted direction
+        norm = np.sqrt(new_vx**2 + new_vy**2)
+        if norm > 0:
+            new_vx = new_vx / norm
+            new_vy = new_vy / norm
+            
+        # Log significant direction changes
+        if abs(dot_product) < 0.7:  # Angle change greater than ~45 degrees
+            self.logger.log("direction_change", LoggerColors.YELLOW, 
+                           f"Significant direction change: ({prev_vx:.2f},{prev_vy:.2f}) → ({new_vx:.2f},{new_vy:.2f})", 1000)
+            
+        return (new_vx, new_vy)
 
     ######################
     # CALLBACK FUNCTIONS #
@@ -176,8 +201,8 @@ class LineDetector(Node):
         if line is None:
             self.no_detection_count += 1
             if self.no_detection_count > self.max_no_detection:
-                # Use default line (center of cropped image) with consistent direction
-                default_vx, default_vy = 0.0, 1.0  # Default downward direction
+                # CHANGED: Use default line with upward direction
+                default_vx, default_vy = 0.0, -1.0  # Default upward direction (negative Y)
                 
                 # Apply direction consistency if we have previous direction
                 if self.previous_direction is not None and self.detection_count >= 3:
