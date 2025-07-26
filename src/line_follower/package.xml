@@ -7,6 +7,10 @@
   <maintainer email="alexrice@mit.edu">alex</maintainer>
   <license>TODO: License declaration</license>
 
+  <depend>sensor_msgs</depend>
+  <depend>camera_ros</depend> 
+  <depend>cv_bridge</depend>
+  
   <exec_depend>rclpy</exec_depend>
   <exec_depend>px4_msgs</exec_depend>
   <exec_depend>line_interfaces</exec_depend>
