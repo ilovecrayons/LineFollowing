@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# adapted from fitline algorithm by sonia
 
 ###########
 # IMPORTS #
@@ -15,6 +16,7 @@ from line_interfaces.msg import Line
 import sys
 from .linreg import process_linreg
 from line_follower.logger import logging_framework
+from line_follower.line_visualizer import create_line_following_debug_image
 
 #############
 # CONSTANTS #
@@ -124,33 +126,15 @@ class LineDetector(Node):
         return np.arccos(cos_angle)
 
     def choose_consistent_direction(self, vx, vy):
-        """
-        Choose the direction vector that maintains consistency with previous movement.
-        A line can point in two directions, so we pick the one closest to previous direction.
-        Args:
-            vx, vy: Current direction vector components
-        Returns:
-            (vx, vy) tuple with consistent direction
-        """
-        # For the first few detections or if no previous direction, use downward preference
-        if self.previous_direction is None or self.detection_count < 3:
-            # Default behavior: prefer downward direction in image
-            if vy < 0:
-                return (-vx, -vy)
-            return (vx, vy)
+        # enforce forward (-y in camera frame) consistency
+        b4_vx, b4_vy = vx, vy
+        if vy > 0:
+            # If vy is positive, the vector is pointing "down" in the image.
+            return (-vx, -vy)
         
-        # Calculate angular distances for both possible directions
-        direction1 = (vx, vy)
-        direction2 = (-vx, -vy)
-        
-        dist1 = self.calculate_angular_distance(direction1, self.previous_direction)
-        dist2 = self.calculate_angular_distance(direction2, self.previous_direction)
-        
-        # Choose the direction with smaller angular distance
-        if dist1 <= dist2:
-            return direction1
-        else:
-            return direction2
+        # If vy is positive or zero, the direction is already correct.
+        logger.log("detector_flip_debug", logging_framework.LoggerColors.YELLOW, f"Choosing consistent direction. Current: ({b4_vx}, {b4_vy}), New: ({vx}, {vy})", 1000)
+        return (vx, vy)
 
     ######################
     # CALLBACK FUNCTIONS #
@@ -232,10 +216,9 @@ class LineDetector(Node):
             image_bgr = image.copy()
 
         # Process with BGR image
-        resulting_image, line_info = process_linreg(image_bgr)
-        linreg_msg = self.bridge.cv2_to_imgmsg(resulting_image, encoding='bgr8')
-        linreg_msg.header = msg.header
-        self.cvresult_pub.publish(linreg_msg)
+        img, line_info = process_linreg(image_bgr)
+
+        
         if line_info is None:
             logger.log("detector", logging_framework.LoggerColors.RED, "No line information received from line processor", 1000)
             return None
@@ -297,7 +280,20 @@ class LineDetector(Node):
         
         # Choose direction that maintains consistency with previous movement
         vx, vy = self.choose_consistent_direction(vx, vy)
-        
+        resulting_image = create_line_following_debug_image(
+        image=img,
+        line_x=x0, line_y=y0, line_vx=vx, line_vy=vy,
+        vx_dc=vx, vy_dc=vy, wz_dc=0.0,
+        # Additional debug info
+        error_x=line_info['error_x'],
+        error_y=line_info['error_y'],
+        confidence=line_info['confidence'],
+        method=line_info['method'],
+        points_detected=line_info['points_detected']
+    )
+        linreg_msg = self.bridge.cv2_to_imgmsg(resulting_image, encoding='bgr8')
+        linreg_msg.header = msg.header
+        self.cvresult_pub.publish(linreg_msg)
         # Store this direction for next iteration and increment detection count
         self.previous_direction = (vx, vy)
         self.detection_count += 1

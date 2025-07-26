@@ -190,7 +190,7 @@ def process_linreg(img):
     cv2.line(result_color, (img_center_x, img_center_y - 30), (img_center_x, img_center_y + 30), (255, 255, 255), 3)
     
     
-    from line_follower.line_visualizer import create_line_following_debug_image
+    
     
     # Simulate basic control calculations for visualization
     EXTEND = 300
@@ -204,29 +204,12 @@ def process_linreg(img):
     error_x = target_x - CENTER[0]
     error_y = target_y - CENTER[1]
     
-    # Simulate velocity commands (basic proportional control)
-    KP_X, KP_Y = 0.8, 0.8
-    simulated_vx_dc = KP_X * error_x / 100.0
-    base_forward_speed = 0.5
-    y_correction = -KP_Y * error_y / 200.0
-    simulated_vy_dc = -(base_forward_speed + y_correction)
-    simulated_wz_dc = 0.0  # No yaw for now
-    
-    # Create comprehensive debug visualization
-    result_color = create_line_following_debug_image(
-        image=img,
-        line_x=x0, line_y=y0, line_vx=vx, line_vy=vy,
-        vx_dc=simulated_vx_dc, vy_dc=simulated_vy_dc, wz_dc=simulated_wz_dc,
-        # Additional debug info
-        error_x=error_x,
-        error_y=error_y,
-        confidence=confidence,
-        method=method_name,
-        points_detected=len(points)
-    )
-    
     # Prepare line info (unchanged)
     line_info = {
+        'method': method_name,
+        'points_detected': len(points),
+        'error_x': float(error_x),
+        'error_y': float(error_y),
         'x_position': float(x0),
         'y_position': float(y0),
         'direction_x': float(vx),
@@ -241,7 +224,7 @@ def process_linreg(img):
         'vy': float(vy)
     }
     
-    return result_color, line_info
+    return img, line_info
 
 
 class linreg(Node):

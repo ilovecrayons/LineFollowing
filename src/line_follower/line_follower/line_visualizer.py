@@ -294,6 +294,6 @@ def create_line_following_debug_image(image: np.ndarray,
     return visualizer.create_debug_visualization(
         image=image,
         line_params=line_params,
-        velocity_commands=velocity_commands,
+        velocity_commands=None,
         control_info=additional_info if additional_info else None
     )
