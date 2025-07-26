@@ -31,14 +31,24 @@ FOV_REDUCTION = 0.6
 
 logger = logging_framework.Logger()
 class LineDetector(Node):
+
+    def blank_cb(self, msg):
+        pass
+
     def __init__(self):
         super().__init__('detector')
 
         # A subscriber to the topic '/aero_downward_camera/image'
-        self.camera_sub = self.create_subscription(
+        self.downward_camera_sub = self.create_subscription(
             Image,
-            '/world/line_following_track/model/x500_mono_cam_down_0/link/camera_link/sensor/imager/image',
+            '/downwardCamera/image_raw',
             self.camera_sub_cb,
+            10
+        )
+        self.forward_camera_sub = self.create_subscription(
+            Image,
+            '/frontCamera/image_raw',
+            self.blank_cb,
             10
         )
 
@@ -147,7 +157,8 @@ class LineDetector(Node):
         """
         # Convert Image msg to OpenCV image
         image = self.bridge.imgmsg_to_cv2(msg, "mono8")
-        
+        image = cv2.rotate(image, cv2.ROTATE_180)
+
         # Crop the image to reduce FOV
         cropped_image = self.crop_center(image)
         
