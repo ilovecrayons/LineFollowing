@@ -5,10 +5,12 @@ import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus
+from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus, VehicleRatesSetpoint, VehicleAttitude
 from line_interfaces.msg import Line
 import tf_transformations as tft
-from .logging_framework import Logger, LoggerColors
+from line_follower.logger import logging_framework
+
+logger = logging_framework.Logger()
 
 #############
 # CONSTANTS #
@@ -16,14 +18,14 @@ from .logging_framework import Logger, LoggerColors
 _RATE = 10 # (Hz) rate for rospy.rate
 _MAX_SPEED = 0.7 # (m/s)
 _MAX_CLIMB_RATE = 1.0 # m/s
-_MAX_ROTATION_RATE = 5.0 # rad/s 
+_MAX_ROTATION_RATE = 5.0 # rad/s
 IMAGE_HEIGHT = 576  # Updated to match actual cropped image dimensions
 IMAGE_WIDTH = 768   # Updated to match actual cropped image dimensions
 CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2]) # Center of the image frame. We will treat this as the center of mass of the drone
 EXTEND = 300 # Number of pixels forward to extrapolate the line
-KP_X = 25   # Keep the same gain for small errors
-KP_Y = 0.7  # Keep forward speed consistent
-KP_Z_W = 1.5  # Keep heading control consistent
+KP_X = 0.1    # Increased for more responsive lateral control
+KP_Y = 0.1    # Increased for more responsive forward/backward control
+KP_Z_W = 5  # Reduced to prevent oscillation
 DISPLAY = True
 
 # Control flags
@@ -115,12 +117,7 @@ class CoordTransforms():
         self.R_fc2fc = np.eye(4)
         
         # Define the transformation matrix from body down to downward camera frame
-        self.R_bd2dc = np.array([
-            [0.0, 1.0, 0.0, 0.0],  # dc.x = bd.y
-            [-1.0, 0.0, 0.0, 0.0], # dc.y = -bd.x
-            [0.0, 0.0, 1.0, 0.0],  # dc.z = bd.z
-            [0.0, 0.0, 0.0, 1.0]   # Fix: Last element should be 1.0, not 0.0
-        ])
+        self.R_bd2dc = self.R_dc2bd.T
     
     
     def static_transform(self, v__fin, fin, fout):
@@ -194,9 +191,11 @@ class LineController(Node):
             VehicleLocalPosition, '/fmu/out/vehicle_local_position', self.vehicle_local_position_callback, qos_profile)
         self.vehicle_status_subscriber = self.create_subscription(
             VehicleStatus, '/fmu/out/vehicle_status', self.vehicle_status_callback, qos_profile)
+        self.vehicle_attitude_subscriber = self.create_subscription(
+            VehicleAttitude, '/fmu/out/vehicle_attitude', self.vehicle_attitude_callback, qos_profile)
         self.line_sub = self.create_subscription(
             Line, '/line/param', self.line_sub_cb, 1)
-
+        
         # Initialize variables
         self.offboard_setpoint_counter = 0
         self.vehicle_local_position = VehicleLocalPosition()
@@ -211,8 +210,8 @@ class LineController(Node):
         # Yaw setpoint velocities in downward camera frame
         self.wz__dc = 0.0
 
-        # Quaternion representing the rotation of the drone's body frame in the NED frame. initiallize to identity quaternion
-        self.quat_bu_lenu = (0, 0, 0, 1)
+        # Quaternion representing the rotation from the lned frame to the bd frame.
+        self.q_bd_lned = np.array([1.0, 0.0, 0.0, 0.0])  # w, x, y, z format, initialized to identity
 
         # Create a timer to publish control commands
         self.timer = self.create_timer(0.1, self.timer_callback)
@@ -247,6 +246,9 @@ class LineController(Node):
     def vehicle_status_callback(self, vehicle_status):
         """Callback function for vehicle_status topic subscriber."""
         self.vehicle_status = vehicle_status
+
+    def vehicle_attitude_callback(self, msg):
+        self.q_bd_lned = msg.q
 
     def arm(self):
         """Send an arm command to the vehicle."""
@@ -285,22 +287,18 @@ class LineController(Node):
     def publish_trajectory_setpoint(self, vx: float, vy: float, wz: float) -> None:
         """Publish the trajectory setpoint."""
         msg = TrajectorySetpoint()
-        msg.position = [None, None, self.takeoff_height]
+        msg.position = [float('nan'), float('nan'), self.takeoff_height]
         if self.offboard_setpoint_counter < 100:
             msg.velocity = [0.0, 0.0, 0.0]
         else:
             msg.velocity = [vx, vy, 0.0]
-        msg.acceleration = [None, None, None]
+        msg.acceleration = [float('nan'), float('nan'), float('nan')]
         msg.yaw = float('nan')
         msg.yawspeed = wz
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+
         self.trajectory_setpoint_publisher.publish(msg)
         
-        # Get current heading for logging
-        current_heading = self.get_current_heading()
-        current_heading_deg = math.degrees(current_heading)
-        
-
     def publish_vehicle_command(self, command, **params) -> None:
         """Publish a vehicle command."""
         msg = VehicleCommand()
@@ -320,37 +318,53 @@ class LineController(Node):
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.vehicle_command_publisher.publish(msg)
 
-    def convert_velocity_setpoints(self):
+    def transform_and_publish_setpoints(self):
         """
-        Convert velocity setpoints from downward camera frame to body down frame.
-        With upward direction priority, velocity commands must be adjusted accordingly.
-        Returns: Tuple (vx_bd, vy_bd, wz_bd) of velocity commands in body down frame
+        Converts velocity commands from DC frame to NED world frame and publishes them.
         """
-        # Transform velocities from camera to body frame
-        vx, vy, vz = self.coord_transforms.static_transform((self.vx__dc, self.vy__dc, self.vz__dc), 'dc', 'bd')
+        # 1. Transform linear velocity from downward camera (dc) to body-down (bd) frame.
+        v__bd = self.coord_transforms.static_transform(
+            (self.vx__dc, self.vy__dc, self.vz__dc), 'dc', 'bd'
+        )
+        logger.log("first_transform", logging_framework.LoggerColors.CYAN, 
+                f"DC frame commands: vx={self.vx__dc:.3f}, vy={self.vy__dc:.3f}, vz={self.vz__dc:.3f} | BD frame commands: vx={v__bd[0]:.3f}, vy={v__bd[1]:.3f}, vz={v__bd[2]:.3f}", 1000)
 
-        # Set angular velocity (convert command angular velocity from downward camera to bd frame)
-        _, _, wz = self.coord_transforms.static_transform((0.0, 0.0, self.wz__dc), 'dc', 'bd')
+            # 2. BD → NED via yaw-only (assume level flight so pitch/roll ≈ 0)
+        #    Extract yaw from the same quaternion:
+        q_px4 = self.q_bd_lned              # PX4: [w, x, y, z]
+        q_tf  = [q_px4[1], q_px4[2], q_px4[3], q_px4[0]]  # tf expects [x,y,z,w]
+        _, _, yaw = tft.euler_from_quaternion(q_tf)        # returns (roll,pitch,yaw)
 
-        # Log the transformation for debugging
-        self.logger.log('coordinate_transform', LoggerColors.BLUE, 
-                       f"Camera frame velocities: vx_dc={self.vx__dc:.3f}, vy_dc={self.vy__dc:.3f}, wz_dc={self.wz__dc:.3f}", 1000)
-        self.logger.log('coordinate_transform', LoggerColors.BLUE, 
-                       f"Body frame velocities: vx_bd={vx:.3f}, vy_bd={vy:.3f}, wz_bd={wz:.3f}", 1000)
+        # 2a. rotate body-frame [vx,vy] by yaw into NED:
+        vx_ned =  v__bd[0]*np.cos(yaw) - v__bd[1]*np.sin(yaw)
+        vy_ned =  v__bd[0]*np.sin(yaw) + v__bd[1]*np.cos(yaw)
 
-        # Enforce safe velocity limits
-        if _MAX_SPEED < 0.0 or _MAX_CLIMB_RATE < 0.0 or _MAX_ROTATION_RATE < 0.0:
-            raise Exception("_MAX_SPEED,_MAX_CLIMB_RATE, and _MAX_ROTATION_RATE must be positive")
-        
-        vx = min(max(vx, -_MAX_SPEED), _MAX_SPEED)
-        vy = min(max(vy, -_MAX_SPEED), _MAX_SPEED)
-        wz = min(max(wz, -_MAX_ROTATION_RATE), _MAX_ROTATION_RATE)
+        # 3. Transform angular velocity (yaw rate) from dc to bd frame.
+        # Yaw rate is a body rate, so it remains in the body frame for publishing.
+        _, _, wz_bd = self.coord_transforms.static_transform(
+        (0.0, 0.0, self.wz__dc), 'dc', 'bd'
+    )
+        logger.log("second_transform", logging_framework.LoggerColors.MAGENTA, 
+                f"BD frame commands: vx={v__bd[0]:.3f}, vy={v__bd[1]:.3f}, vz={v__bd[2]:.3f} | NED frame commands: vx={vx_ned:.3f}, vy={vy_ned:.3f} | Yaw rate BD: wz={wz_bd:.3f}", 1000)
+        # 4. Enforce safety limits.
+        # Apply speed limit to the magnitude of the velocity vector in the world frame.
+        velocity_magnitude = np.sqrt(vx_ned**2 + vy_ned**2)
+        if velocity_magnitude > _MAX_SPEED:
+            scale = _MAX_SPEED / velocity_magnitude
+            vx_ned *= scale
+            vy_ned *= scale
 
-        return (vx, vy, wz)
+        # Apply rotation rate limit to the body-frame yaw rate.
+        wz_bd = min(max(wz_bd, -_MAX_ROTATION_RATE), _MAX_ROTATION_RATE)
+
+        # 5. Publish the final trajectory setpoint message.
+        # vx_ned = 0.0
+        # vy_ned = 0.0
+        # wz_bd = 0.0
+        self.publish_trajectory_setpoint(vx_ned, vy_ned, wz_bd)
     
     def timer_callback(self) -> None:
         """Callback function for the timer."""
-
         self.publish_offboard_control_heartbeat_signal()
         
         if self.offboard_setpoint_counter == 10:
@@ -361,11 +375,11 @@ class LineController(Node):
     
     def line_sub_cb(self, param):
         """
-        Callback function which is called when a new message of type Line is recieved by self.line_sub.
-        Notes:
-        - This is the function that maps a detected line into a velocity 
-        command
+        Calculates desired velocity in the downward-camera (DC) frame based on line parameters.
+        The drone should follow the line, not necessarily align its heading with the line direction.
         """
+        logger.log("line_sub", logging_framework.LoggerColors.BLUE, "Received line parameters", 1000)
+        
         # Extract line parameters
         x, y, vx, vy = param.x, param.y, param.vx, param.vy
         
@@ -383,157 +397,28 @@ class LineController(Node):
         error_x = target_x - CENTER[0]
         error_y = target_y - CENTER[1]
         
-        # Get current heading of the drone
-        current_heading = self.get_current_heading()
+        # Lateral control: error_x directly controls lateral movement in the camera frame.
+        self.vx__dc = KP_X * error_x / 100.0
         
-        # For heading control: align with line direction
-        vx_bd, vy_bd, _ = self.coord_transforms.static_transform((vx, vy, 0.0), 'dc', 'bd')
+        # Forward movement: maintain a constant forward speed, adjusted by y_error.
+        base_forward_speed = 0.5
+        y_correction = -KP_Y * error_y / 200.0
+        self.vy__dc = -(base_forward_speed + y_correction)  # Negative for forward movement in DC frame
         
-        # Calculate desired heading in body frame
-        desired_heading = np.arctan2(vy_bd, vx_bd)
+        # Heading control: align drone's heading with the line's direction.
+        desired_heading = np.arctan2(vx, -vy)
+        angular_error = self.normalize_angle(desired_heading)
+        self.wz__dc = KP_Z_W * angular_error / 10.0
         
-        # Calculate angular error (difference between desired and current heading)
-        angular_error = self.normalize_angle(desired_heading - current_heading)
-        
-        # Calculate yaw rate
-        self.wz__dc = KP_Z_W * angular_error
-        
-        # Store previous heading for tracking
-        prev_heading = getattr(self, '_prev_heading', current_heading)
-        heading_change = self.normalize_angle(current_heading - prev_heading)
-        self._prev_heading = current_heading
-        
-        # SIMPLIFIED: Clearer control logic with fewer calculations
-        if abs(angular_error) > np.radians(30):  # If more than 30 degrees off
-            # ROTATION MODE: Pure rotation with minimal movement
-            self.vx__dc = 0.0
-            self.vy__dc = 0.05  # Very minimal forward movement
-            
-            self.logger.log("mode_change", LoggerColors.YELLOW, 
-                          f"ROTATION MODE: Large angular error {math.degrees(angular_error):.1f}°", 1000)
-        else:
-            # IMPROVED TRACKING: Prioritize lateral position over forward motion
-            
-            # Calculate error magnitude - used to determine control mode
-            error_magnitude = abs(error_x)
-            
-            # FIXED: Apply the same direct body frame approach to all recovery modes
-            if error_magnitude > 100:  # Far from line - position recovery or emergency
-                # Determine scales based on error severity
-                if error_magnitude > 200:  # Emergency recovery
-                    lateral_scale = 0.6  # 60% of max speed for lateral
-                    forward_scale = 0.0  # No forward motion
-                    recovery_type = "EMERGENCY RECOVERY"
-                else:  # Position recovery
-                    lateral_scale = 0.5  # 50% of max speed for lateral
-                    forward_scale = 0.02  # Minimal forward motion (reduced from 0.05)
-                    recovery_type = "POSITION RECOVERY"
-                
-                # FIXED: Use direct body frame control for consistent behavior in all recovery modes
-                # Calculate direct body frame velocities
-                if error_x > 0:  # Line is to the right of center
-                    # Move right in body frame
-                    body_vx = forward_scale * _MAX_SPEED  # Minimal or zero forward motion
-                    body_vy = lateral_scale * _MAX_SPEED  # Move right at specified scale
-                else:  # Line is to the left of center
-                    # Move left in body frame
-                    body_vx = forward_scale * _MAX_SPEED  # Minimal or zero forward motion
-                    body_vy = -lateral_scale * _MAX_SPEED  # Move left at specified scale
-                
-                # Convert body velocities back to camera frame
-                self.vx__dc, self.vy__dc, _ = self.coord_transforms.static_transform(
-                    (body_vx, body_vy, 0.0), 'bd', 'dc')
-                
-                self.logger.log("control_mode", LoggerColors.RED, 
-                              f"{recovery_type}: error_x={error_x:.1f}px (DIRECT CONTROL)", 1000)
-                
-                # Log the actual body frame velocities
-                self.logger.log("correction_details", LoggerColors.BLUE,
-                              f"DIRECT MOTION: body_vx={body_vx:.2f}, body_vy={body_vy:.2f}", 1000)
-            
-            else:  # Close to line - normal tracking
-                # Keep existing normal tracking code unchanged
-                lateral_scale = 0.2
-                forward_scale = 0.2
-                self.logger.log("control_mode", LoggerColors.GREEN, 
-                              f"NORMAL TRACKING: error_x={error_x:.1f}px", 1000)
-                
-                # Calculate correction factor
-                correction_factor = KP_X * error_x / 50.0
-                # Apply absolute limit to correction factor
-                correction_factor = max(min(correction_factor, MAX_CORRECTION_FACTOR), -MAX_CORRECTION_FACTOR)
-                
-                # Calculate perpendicular direction to the line
-                perpendicular_x = -vy  # Perpendicular to line direction
-                perpendicular_y = vx
-                
-                # Normalize perpendicular vector
-                perp_norm = np.sqrt(perpendicular_x**2 + perpendicular_y**2)
-                if perp_norm > 0:
-                    perpendicular_x /= perp_norm
-                    perpendicular_y /= perp_norm
-                
-                # Apply lateral correction and forward motion
-                self.vx__dc = perpendicular_x * correction_factor * lateral_scale
-                self.vy__dc = perpendicular_y * correction_factor * lateral_scale
-                self.vx__dc += vx * forward_scale
-                self.vy__dc += vy * forward_scale
-                
-                # Log correction details
-                self.logger.log("correction_details", LoggerColors.BLUE,
-                              f"Correction: factor={correction_factor:.2f}, scales=[lat:{lateral_scale:.2f},fwd:{forward_scale:.2f}]", 1000)
-            
-            self.logger.log("mode_change", LoggerColors.GREEN, 
-                          f"TRACKING MODE: Angular error {math.degrees(angular_error):.1f}°", 1000)
-        
-        # Add detailed logging
-        self.logger.log("direction_vectors", LoggerColors.BLUE, 
-                       f"Line direction: camera=({vx:.2f},{vy:.2f}), body=({vx_bd:.2f},{vy_bd:.2f})", 1000)
-        self.logger.log("velocity_vectors", LoggerColors.BLUE, 
-                       f"Velocity cmd: camera=({self.vx__dc:.2f},{self.vy__dc:.2f})", 1000)
-        
-        # Log both the raw line direction and transformed direction
-        self.logger.log("heading_control", LoggerColors.CYAN, 
-                        f"Line direction in camera frame: ({vx:.2f}, {vy:.2f}), "
-                        f"transformed to body frame: ({vx_bd:.2f}, {vy_bd:.2f})", 1000)
-        
-        # Enhanced heading tracking log
-        self.logger.log("heading_tracking", LoggerColors.GREEN,
-                        f"Heading control: current={math.degrees(current_heading):.1f}° "
-                        f"desired={math.degrees(desired_heading):.1f}° "
-                        f"error={math.degrees(angular_error):.1f}° "
-                        f"change={math.degrees(heading_change):.3f}°/cycle "
-                        f"wz_cmd={self.wz__dc:.3f}", 1000)
-        
-        # Convert and publish velocity commands
-        vx_bd, vy_bd, wz_bd = self.convert_velocity_setpoints()
-        
-        # Conditional velocity output based on control flag
-        if ENABLE_HORIZONTAL_VELOCITY:
-            actual_vx, actual_vy, actual_wz = vx_bd, vy_bd, wz_bd
-            control_mode = "FULL CONTROL"
-        else:
-            actual_vx, actual_vy, actual_wz = 0.0, 0.0, wz_bd
-            control_mode = "YAW ONLY"
-        
-        # Get current heading for final logging
-        current_heading_deg = math.degrees(current_heading)
-        desired_heading_deg = math.degrees(desired_heading)
-        angular_error_deg = math.degrees(angular_error);
-        
-        # Single comprehensive velocity log message - force=True to bypass rate limiting
-        velocity_message = (f"VELOCITY CONTROL [{control_mode}] | "
-                        f"Errors: x={error_x:.0f}px y={error_y:.0f}px | "
-                        f"Heading: curr={current_heading_deg:.0f}° des={desired_heading_deg:.0f}° err={angular_error_deg:.0f}° | "
-                        f"TARGET: vx={vx_bd:.3f} vy={vy_bd:.3f} yaw={wz_bd:.3f} | "
-                        f"OUTPUT: vx={actual_vx:.3f} vy={actual_vy:.3f} yaw={actual_wz:.3f}")
-        
-        # Log with force=True to bypass rate limiting
-        self.logger.log("velocity_commands", LoggerColors.MAGENTA, velocity_message, 1000)
+        # Debug control outputs before coordinate transformation
+        # debug
+        # self.vx__dc = 1.0
+        # self.vy__dc = 0.0
+        # self.wz__dc = 0.0
 
+        # Convert commands to the correct frames and publish
         
-        # Publish the actual values
-        self.publish_trajectory_setpoint(actual_vx, actual_vy, actual_wz)
+        self.transform_and_publish_setpoints()
     
     def normalize_angle(self, angle):
         """Normalize angle to be between -pi and pi"""

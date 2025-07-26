@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# adapted from fitline algorithm by sonia
 
 ###########
 # IMPORTS #
@@ -14,7 +15,8 @@ from cv_bridge import CvBridge, CvBridgeError
 from line_interfaces.msg import Line
 import sys
 from .linreg import process_linreg
-from .logging_framework import Logger, LoggerColors
+from line_follower.logger import logging_framework
+from line_follower.line_visualizer import create_line_following_debug_image
 
 #############
 # CONSTANTS #
@@ -27,6 +29,7 @@ DISPLAY = True
 # Define FOV reduction factor (0.5 = 50% reduction)
 FOV_REDUCTION = 0.6
 
+logger = logging_framework.Logger()
 class LineDetector(Node):
     def __init__(self):
         super().__init__('detector')
@@ -126,58 +129,15 @@ class LineDetector(Node):
         return np.arccos(cos_angle)
 
     def choose_consistent_direction(self, vx, vy):
-        """
-        Choose the direction vector that maintains consistency with previous movement.
-        A line can point in two directions, so we pick the one closest to previous direction.
-        Args:
-            vx, vy: Current direction vector components
-        Returns:
-            (vx, vy) tuple with consistent direction
-        """
-        # Normalize input direction vector
-        norm = np.sqrt(vx**2 + vy**2)
-        if norm > 0:
-            vx = vx / norm
-            vy = vy / norm
-
-        # For the first few detections or if no previous direction
-        if self.previous_direction is None or self.detection_count < 3:
-            # CHANGED: Default behavior now prefers NEGATIVE y direction (upward in image)
-            if vy > 0:  # If pointing downward
-                return (-vx, -vy)  # Flip to point upward
-            return (vx, vy)  # Already pointing upward, keep as is
+        # enforce forward (-y in camera frame) consistency
+        b4_vx, b4_vy = vx, vy
+        if vy > 0:
+            # If vy is positive, the vector is pointing "down" in the image.
+            return (-vx, -vy)
         
-        # After initial detections, prioritize gradual changes in direction
-        # This prevents the drone from suddenly reversing direction
-        prev_vx, prev_vy = self.previous_direction
-        
-        # Calculate dot product to determine if directions are similar
-        dot_product = vx * prev_vx + vy * prev_vy
-        
-        # If dot product is negative, the vectors point in opposite directions
-        # Flip the current vector to maintain consistency
-        if dot_product < 0:
-            vx = -vx
-            vy = -vy
-            
-        # Update previous direction with a weighted average to allow gradual changes
-        # This creates smoother transitions when the line curves
-        alpha = 0.8  # Weight for previous direction (higher = more smoothing)
-        new_vx = alpha * prev_vx + (1-alpha) * vx
-        new_vy = alpha * prev_vy + (1-alpha) * vy
-        
-        # Renormalize the weighted direction
-        norm = np.sqrt(new_vx**2 + new_vy**2)
-        if norm > 0:
-            new_vx = new_vx / norm
-            new_vy = new_vy / norm
-            
-        # Log significant direction changes
-        if abs(dot_product) < 0.7:  # Angle change greater than ~45 degrees
-            self.logger.log("direction_change", LoggerColors.YELLOW, 
-                           f"Significant direction change: ({prev_vx:.2f},{prev_vy:.2f}) → ({new_vx:.2f},{new_vy:.2f})", 1000)
-            
-        return (new_vx, new_vy)
+        # If vy is positive or zero, the direction is already correct.
+        logger.log("detector_flip_debug", logging_framework.LoggerColors.YELLOW, f"Choosing consistent direction. Current: ({b4_vx}, {b4_vy}), New: ({vx}, {vy})", 1000)
+        return (vx, vy)
 
     ######################
     # CALLBACK FUNCTIONS #
@@ -201,8 +161,9 @@ class LineDetector(Node):
         if line is None:
             self.no_detection_count += 1
             if self.no_detection_count > self.max_no_detection:
-                # CHANGED: Use default line with upward direction
-                default_vx, default_vy = 0.0, -1.0  # Default upward direction (negative Y)
+                # Use default line (center of cropped image) with consistent direction
+                logger.log("detector", logging_framework.LoggerColors.YELLOW, "Using default line after multiple detection failures", 1000)
+                default_vx, default_vy = 0.0, 1.0  # Default downward direction
                 
                 # Apply direction consistency if we have previous direction
                 if self.previous_direction is not None and self.detection_count >= 3:
@@ -257,12 +218,12 @@ class LineDetector(Node):
         else:
             image_bgr = image.copy()
 
-        # Process with BGR image (no heading available in detector, use default)
-        resulting_image, line_info = process_linreg(image_bgr, 0.0)
-        linreg_msg = self.bridge.cv2_to_imgmsg(resulting_image, encoding='bgr8')
-        linreg_msg.header = msg.header
-        self.cvresult_pub.publish(linreg_msg)
+        # Process with BGR image
+        img, line_info = process_linreg(image_bgr)
+
+        
         if line_info is None:
+            logger.log("detector", logging_framework.LoggerColors.RED, "No line information received from line processor", 1000)
             return None
             
         # Comprehensive check for invalid line data
@@ -270,6 +231,7 @@ class LineDetector(Node):
             'slope' not in line_info or 
             'intercept' not in line_info or 
             'is_vertical' not in line_info):
+            logger.log("detector_warn", logging_framework.LoggerColors.YELLOW, "Invalid line information received from line processor", 1000)
             return None
             
         # Extract values from line_info - now with enhanced curve support
@@ -286,7 +248,7 @@ class LineDetector(Node):
             vy = line_info['direction_y']
             x = x0
             y = y0
-            
+
         else:
             # Fallback to traditional slope-based calculation
             if vertical:
@@ -310,6 +272,7 @@ class LineDetector(Node):
         
         # Check if any of the line parameters are NaN
         if (np.isnan(x) or np.isnan(y) or np.isnan(vx) or np.isnan(vy)):
+            logger.log("detector_warn", logging_framework.LoggerColors.YELLOW, "Detected line parameters contain NaN values", 1000)
             return None
         
         # Normalize direction vector
@@ -320,11 +283,25 @@ class LineDetector(Node):
         
         # Choose direction that maintains consistency with previous movement
         vx, vy = self.choose_consistent_direction(vx, vy)
-        
+        resulting_image = create_line_following_debug_image(
+        image=img,
+        line_x=x0, line_y=y0, line_vx=vx, line_vy=vy,
+        vx_dc=vx, vy_dc=vy, wz_dc=0.0,
+        # Additional debug info
+        error_x=line_info['error_x'],
+        error_y=line_info['error_y'],
+        confidence=line_info['confidence'],
+        method=line_info['method'],
+        points_detected=line_info['points_detected']
+    )
+        linreg_msg = self.bridge.cv2_to_imgmsg(resulting_image, encoding='bgr8')
+        linreg_msg.header = msg.header
+        self.cvresult_pub.publish(linreg_msg)
         # Store this direction for next iteration and increment detection count
         self.previous_direction = (vx, vy)
         self.detection_count += 1
-        
+
+        logger.log("detector", logging_framework.LoggerColors.GREEN, f"Detected line: x={x}, y={y}, vx={vx}, vy={vy} (detection #{self.detection_count})", 1000)
         return (x, y, vx, vy)
 
 

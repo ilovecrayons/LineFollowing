@@ -6,20 +6,9 @@ from px4_msgs.msg import VehicleLocalPosition
 import cv2
 from cv_bridge import CvBridge 
 import numpy as np
-import math
-import tf_transformations as tft
-from .logging_framework import Logger, LoggerColors
+from line_follower.logger import logging_framework
 
-# Initialize component logger
-logger = Logger()
-
-def normalize_angle(angle):
-    """Normalize angle to be between -pi and pi"""
-    while angle > np.pi:
-        angle -= 2 * np.pi
-    while angle < -np.pi:
-        angle += 2 * np.pi
-    return angle
+logger = logging_framework.Logger()
 
 def detect_white_strict(img):
     """Detect white pixels with strict thresholds"""
@@ -69,7 +58,7 @@ def process_linreg(img, current_heading=0.0):
                 'slope': slope, 'intercept': intercept, 'is_vertical': bool, 'confidence': float}
                or None if no line detected
     """
-    
+
     # Create working copy
     result_img = img.copy()
     
@@ -89,7 +78,6 @@ def process_linreg(img, current_heading=0.0):
         try:
             binary, valid = method_func()
             white_pixels = np.sum(binary > 0)
-            
             if valid:
                 break
         except Exception as e:
@@ -115,10 +103,8 @@ def process_linreg(img, current_heading=0.0):
     # Now we have a binary mask from one of the detection methods
     # Find line points for cv2.fitLine
     points = np.argwhere(binary > 0)
-    # logger.debug("processing_details", f"Line points found: {len(points)}")
     
     if len(points) < 10:  # Need minimum points for reliable fitting
-        # logger.info("detection_events", "Insufficient points for line fitting")
         return result_img, None
     
     # Convert points to (x,y) format for cv2.fitLine
@@ -196,47 +182,23 @@ def process_linreg(img, current_heading=0.0):
     end_y = int(center_y + arrow_length * vy)
     cv2.arrowedLine(result_color, (center_x, center_y), (end_x, end_y), (0, 255, 255), 6)  # Cyan arrow (thicker)
     
-    # Add a marker to explicitly show the "forward" direction
-    forward_x = int(center_x + 130 * vx)
-    forward_y = int(center_y + 130 * vy)
-    cv2.circle(result_color, (forward_x, forward_y), 12, (255, 0, 255), -1)  # Purple circle indicating "forward"
-    cv2.putText(result_color, "FWD", (forward_x + 5, forward_y + 5), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)  # Label the forward direction
-    
-    # Add target point visualization (EXTEND pixels ahead along the line)
-    EXTEND = 300  # Same as in tracker.py
-    target_x = int(center_x + EXTEND * vx)
-    target_y = int(center_y + EXTEND * vy)
-    
-    # Draw target point if it's within image bounds
-    if 0 <= target_x < cols and 0 <= target_y < rows:
-        cv2.circle(result_color, (target_x, target_y), 20, (0, 255, 0), -1)  # Green target point
-        cv2.circle(result_color, (target_x, target_y), 20, (255, 255, 255), 3)  # White border for visibility
-        
-        # Draw line from center to target
-        cv2.line(result_color, (center_x, center_y), (target_x, target_y), (0, 255, 0), 3)  # Green line to target
-    
-    # Add image center indicator (where drone currently is)
-    img_center_x = cols // 2
-    img_center_y = rows // 2
-    cv2.circle(result_color, (img_center_x, img_center_y), 12, (255, 255, 0), -1)  # Yellow drone position
-    cv2.circle(result_color, (img_center_x, img_center_y), 12, (0, 0, 0), 2)  # Black border
-    
-    # Draw heading indicators using actual drone heading and desired heading
-    heading_length = 80
-    
-    # Current heading (blue)
-    heading_end_x = int(img_center_x + heading_length * math.sin(current_heading))
-    heading_end_y = int(img_center_y - heading_length * math.cos(current_heading))
-    cv2.arrowedLine(result_color, (img_center_x, img_center_y), (heading_end_x, heading_end_y), (255, 0, 0), 4)  # Blue current heading
-    
-    # Desired heading (red)
-    desired_end_x = int(img_center_x + heading_length * math.sin(desired_heading))
-    desired_end_y = int(img_center_y - heading_length * math.cos(desired_heading))
-    cv2.arrowedLine(result_color, (img_center_x, img_center_y), (desired_end_x, desired_end_y), (0, 0, 255), 4)  # Red desired heading
-    
     # Add text background for better readability
-    cv2.rectangle(result_color, (5, 5), (400, 280), (0, 0, 0), -1)  # Black background (made taller)
+    cv2.rectangle(result_color, (5, 5), (400, 160), (0, 0, 0), -1)  # Black background
+    
+    
+    
+    # Calculate slope and intercept
+    if abs(vx) > 1e-6:
+        slope = vy / vx
+        intercept = y0 - slope * x0
+        is_vertical = False
+    else:
+        slope = np.inf
+        intercept = np.nan
+        is_vertical = True
+    
+    # Calculate confidence based on number of inlier points
+    confidence = min(1.0, len(points) / 1000.0)  # Simple confidence metric
     
     # Add comprehensive debug info to visualization with better visibility
     cv2.putText(result_color, f"Confidence: {confidence:.3f}", (10, 30), 
@@ -252,46 +214,48 @@ def process_linreg(img, current_heading=0.0):
     cv2.putText(result_color, f"Method: {method_name}", (10, 180), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     
-    # Display headings and error information
-    heading_deg = math.degrees(current_heading)
-    desired_heading_deg = math.degrees(desired_heading)
-    angular_error_deg = math.degrees(angular_error)
+    # Add image center crosshair for reference (bright white)
+    img_center_x = cols // 2
+    img_center_y = rows // 2
+    cv2.line(result_color, (img_center_x - 30, img_center_y), (img_center_x + 30, img_center_y), (255, 255, 255), 3)
+    cv2.line(result_color, (img_center_x, img_center_y - 30), (img_center_x, img_center_y + 30), (255, 255, 255), 3)
     
-    cv2.putText(result_color, f"Current: {heading_deg:.1f}°", (10, 210), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2)  # Blue text for current heading
-    cv2.putText(result_color, f"Desired: {desired_heading_deg:.1f}°", (170, 210), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2)  # Red text for desired heading
-    cv2.putText(result_color, f"Error: {angular_error_deg:.1f}°", (330, 210), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 100), 2)  # Green text for error
     
-    # CHANGED: Update direction convention info in visualization
-    cv2.putText(result_color, "Direction Priority: -Y (upward)", (10, 240), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
-    # Add legend for heading arrows
-    cv2.putText(result_color, "Blue: Current | Red: Desired | Cyan: Line", (10, 270), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
-    # logger.info("detection_events", f"Line detected: pos=({x0:.1f},{y0:.1f}), dir=({vx:.3f},{vy:.3f}), conf={confidence:.3f}")
+    # Simulate basic control calculations for visualization
+    EXTEND = 300
+    IMAGE_WIDTH = img.shape[1] 
+    IMAGE_HEIGHT = img.shape[0]
+    CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2])
     
-    # Prepare line info for the controller - using field names expected by detector.py
+    # Calculate what the control system would calculate
+    target_x = x0 + EXTEND * vx
+    target_y = y0 + EXTEND * vy
+    error_x = target_x - CENTER[0]
+    error_y = target_y - CENTER[1]
+    
+    # Prepare line info (unchanged)
     line_info = {
-        'x_position': float(x0),      # Expected by detector.py
-        'y_position': float(y0),      # Expected by detector.py
-        'direction_x': float(vx),     # Expected by detector.py for curve support
-        'direction_y': float(vy),     # Expected by detector.py for curve support
+        'method': method_name,
+        'points_detected': len(points),
+        'error_x': float(error_x),
+        'error_y': float(error_y),
+        'x_position': float(x0),
+        'y_position': float(y0),
+        'direction_x': float(vx),
+        'direction_y': float(vy),
         'slope': float(slope),
         'intercept': float(intercept),
         'is_vertical': is_vertical,
         'confidence': confidence,
-        # Keep original names for backwards compatibility
         'x': float(x0),
         'y': float(y0), 
         'vx': float(vx),
         'vy': float(vy)
     }
     
-    return result_color, line_info
+    return img, line_info
 
 
 class linreg(Node):
@@ -361,12 +325,8 @@ class linreg(Node):
             # Publish result image
             ros_image_msg = bridge.cv2_to_imgmsg(result_img, encoding='bgr8')
             self.annotated_img_pub.publish(ros_image_msg)
-            
-        except Exception as e:
-            pass
-            # self.logger.error("errors", f"Error in image processing: {str(e)}")
-
-        # self.logger.debug("processing_details", "Callback function running")
+        except:
+            logger.log("linreg_error", logging_framework.LoggerColors.RED, "Failed to process image", 1000, force=True)
 
 
 def main(args=None):
