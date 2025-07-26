@@ -16,7 +16,7 @@ logger = logging_framework.Logger()
 # CONSTANTS #
 #############
 _RATE = 10 # (Hz) rate for rospy.rate
-_MAX_SPEED = 1.5 # (m/s)
+_MAX_SPEED = 0.7 # (m/s)
 _MAX_CLIMB_RATE = 1.0 # m/s
 _MAX_ROTATION_RATE = 5.0 # rad/s
 IMAGE_HEIGHT = 576  # Updated to match actual cropped image dimensions
@@ -27,6 +27,10 @@ KP_X = 0.1    # Increased for more responsive lateral control
 KP_Y = 0.1    # Increased for more responsive forward/backward control
 KP_Z_W = 5  # Reduced to prevent oscillation
 DISPLAY = True
+
+# Control flags
+ENABLE_HORIZONTAL_VELOCITY = True  # Set to True to enable vx and vy output
+MAX_CORRECTION_FACTOR = 10.0  # Absolute maximum correction factor
 
 #########################
 # COORDINATE TRANSFORMS #
@@ -161,6 +165,8 @@ class LineController(Node):
     def __init__(self) -> None:
         super().__init__('line_controller')
 
+        self.logger = Logger()
+
         # Create CoordTransforms instance
         self.coord_transforms = CoordTransforms()
 
@@ -213,6 +219,29 @@ class LineController(Node):
     def vehicle_local_position_callback(self, vehicle_local_position):
         """Callback function for vehicle_local_position topic subscriber."""
         self.vehicle_local_position = vehicle_local_position
+        
+    def get_current_heading(self):
+        """
+        Extract current heading (yaw) from vehicle local position quaternion.
+        Returns heading in radians (-pi to pi).
+        """
+        try:
+            # Extract quaternion from vehicle local position
+            q = [
+                self.vehicle_local_position.q[1],  # x
+                self.vehicle_local_position.q[2],  # y  
+                self.vehicle_local_position.q[3],  # z
+                self.vehicle_local_position.q[0]   # w (PX4 uses w-first format, tf uses w-last)
+            ]
+            
+            # Convert quaternion to euler angles
+            euler = tft.euler_from_quaternion(q)
+            yaw = euler[2]  # Yaw is the third component (roll, pitch, yaw)
+            
+            return yaw
+        except (AttributeError, IndexError):
+            # Return 0 if quaternion data is not available yet
+            return 0.0
 
     def vehicle_status_callback(self, vehicle_status):
         """Callback function for vehicle_status topic subscriber."""
@@ -225,24 +254,24 @@ class LineController(Node):
         """Send an arm command to the vehicle."""
         self.publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
-        self.get_logger().info('Arm command sent')
+        self.logger.log('system_events', LoggerColors.GREEN, 'Arm command sent', 1000)
 
     def disarm(self):
         """Send a disarm command to the vehicle."""
         self.publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
-        self.get_logger().info('Disarm command sent')
+        self.logger.log('system_events', LoggerColors.RED, 'Disarm command sent', 1000)
 
     def engage_offboard_mode(self):
         """Switch to offboard mode."""
         self.publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
-        self.get_logger().info("Switching to offboard mode")
+        self.logger.log('system_events', LoggerColors.YELLOW, "Switching to offboard mode", 1000)
 
     def land(self):
         """Switch to land mode."""
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
-        self.get_logger().info("Switching to land mode")
+        self.logger.log('system_events', LoggerColors.YELLOW, "Switching to land mode", 1000)
 
     def publish_offboard_control_heartbeat_signal(self):
         """Publish the offboard control mode."""
@@ -250,7 +279,7 @@ class LineController(Node):
         msg.position = True
         msg.velocity = True
         msg.acceleration = False
-        msg.attitude = False
+        msg.attitude = True
         msg.body_rate = True
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.offboard_control_mode_publisher.publish(msg)
@@ -400,7 +429,7 @@ class LineController(Node):
         return angle
 
 def main(args=None) -> None:
-    print('Starting offboard control node...')
+    
     rclpy.init(args=args)
     offboard_control = LineController()
     rclpy.spin(offboard_control)
@@ -409,7 +438,4 @@ def main(args=None) -> None:
 
 
 if __name__ == '__main__':
-    try:
-        main()
-    except Exception as e:
-        print(e)
+    main()

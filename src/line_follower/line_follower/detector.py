@@ -34,6 +34,9 @@ class LineDetector(Node):
     def __init__(self):
         super().__init__('detector')
 
+        # Initialize custom logger
+        self.logger = Logger()
+
         # A subscriber to the topic '/aero_downward_camera/image'
         self.camera_sub = self.create_subscription(
             Image,
@@ -306,13 +309,12 @@ class LineDetector(Node):
 def main(args=None):
     rclpy.init(args=args)
     detector = LineDetector()
-    detector.get_logger().info("Line detector initialized")
     try:
         rclpy.spin(detector)
     except KeyboardInterrupt:
-        print("Shutting down")
+        pass
     except Exception as e:
-        print(e)
+        pass
     finally:
         detector.destroy_node()
         rclpy.shutdown()

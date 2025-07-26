@@ -1,6 +1,8 @@
 import rclpy
 from rclpy.node import Node 
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image
+from px4_msgs.msg import VehicleLocalPosition
 import cv2
 from cv_bridge import CvBridge 
 import numpy as np
@@ -44,11 +46,12 @@ def detect_color_edges(img):
     mask = cv2.dilate(edges, kernel, iterations=2)
     return mask, np.sum(mask > 0) > 100
 
-def process_linreg(img):
+def process_linreg(img, current_heading=0.0):
     """
     Simple line detection using OpenCV fitLine.
     Args:
         img: Input image (BGR format)
+        current_heading: Current drone heading in radians for visualization
     Returns:
         tuple: (display_img, line_info) where line_info contains:
                {'x': x_position, 'y': y_position, 'vx': direction_x, 'vy': direction_y, 
@@ -111,8 +114,34 @@ def process_linreg(img):
     line_fit = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
     vx, vy, x0, y0 = line_fit.flatten()  # extract scalars from numpy arrays
     
+    # CHANGED: Ensure consistent direction - prefer NEGATIVE y direction (upward in image)
+    # This matches the updated direction convention in detector.py
+    if vy > 0:  # If pointing downward
+        vx = -vx
+        vy = -vy  # Flip to point upward
+    
+    # Calculate desired heading from line direction (same formula as in tracker.py)
+    vx_bd, vy_bd = vx, -vy  # Approximation of camera-to-body transform for visualization
+    desired_heading = np.arctan2(vx_bd, vy_bd)  # This matches tracker.py's calculation
+    
+    # Calculate angular error
+    angular_error = normalize_angle(desired_heading - current_heading)
+    
     # Calculate line parameters
     rows, cols = binary.shape
+    
+    # Calculate slope, intercept, and vertical flag
+    if abs(vx) > 1e-6:  # Not vertical
+        slope = vy / vx
+        intercept = y0 - slope * x0
+        is_vertical = False
+    else:  # Vertical line
+        slope = float('inf')
+        intercept = x0  # For vertical lines, store x-intercept
+        is_vertical = True
+    
+    # Calculate confidence based on number of points and line fit quality
+    confidence = min(1.0, len(points) / 500.0)  # Normalize by expected max points
     
     # Calculate line endpoints for visualization
     lefty = int((-x0 * vy / vx) + y0) if vx != 0 else 0
@@ -147,7 +176,7 @@ def process_linreg(img):
     center_y = int(y0)
     cv2.circle(result_color, (center_x, center_y), 15, (255, 0, 255), -1)  # Magenta center point (larger)
     
-    # Draw direction arrow
+    # Draw direction arrow - highlighting the ACTUAL direction that will be used
     arrow_length = 100
     end_x = int(center_x + arrow_length * vx)
     end_y = int(center_y + arrow_length * vy)
@@ -178,9 +207,11 @@ def process_linreg(img):
                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     cv2.putText(result_color, f"Direction: ({vx:.3f}, {vy:.3f})", (10, 90), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.putText(result_color, f"Points: {len(points)}", (10, 120), 
+    cv2.putText(result_color, f"Target: ({target_x}, {target_y})", (10, 120), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.putText(result_color, f"Method: {method_name}", (10, 150), 
+    cv2.putText(result_color, f"Points: {len(points)}", (10, 150), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(result_color, f"Method: {method_name}", (10, 180), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     
     # Add image center crosshair for reference (bright white)
@@ -230,18 +261,66 @@ def process_linreg(img):
 class linreg(Node):
     def __init__(self):
         super().__init__('linreg_test')
-        self.get_logger().info("Simple Line Regression Node Started")
+        # self.logger = get_logger('linreg')
+        # self.logger.system("startup", "Simple Line Regression Node Started")
+        
+        # Configure QoS profile for PX4 messages
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        
+        # Store current heading for visualization
+        self.current_heading = 0.0
+        self.vehicle_local_position = None
 
         self.image_sub = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
         self.annotated_img_pub = self.create_publisher(Image, 'final_image', 10)
+        
+        # Subscribe to vehicle position to get current heading
+        self.vehicle_local_position_subscriber = self.create_subscription(
+            VehicleLocalPosition, '/fmu/out/vehicle_local_position', self.vehicle_local_position_callback, qos_profile)
+            
+    def vehicle_local_position_callback(self, vehicle_local_position):
+        """Callback function for vehicle_local_position topic subscriber."""
+        self.vehicle_local_position = vehicle_local_position
+        self.current_heading = self.get_current_heading()
+        
+    def get_current_heading(self):
+        """
+        Extract current heading (yaw) from vehicle local position quaternion.
+        Returns heading in radians (-pi to pi).
+        """
+        if self.vehicle_local_position is None:
+            return 0.0
+            
+        try:
+            # Extract quaternion from vehicle local position
+            q = [
+                self.vehicle_local_position.q[1],  # x
+                self.vehicle_local_position.q[2],  # y  
+                self.vehicle_local_position.q[3],  # z
+                self.vehicle_local_position.q[0]   # w (PX4 uses w-first format, tf uses w-last)
+            ]
+            
+            # Convert quaternion to euler angles
+            euler = tft.euler_from_quaternion(q)
+            yaw = euler[2]  # Yaw is the third component (roll, pitch, yaw)
+            
+            return yaw
+        except (AttributeError, IndexError):
+            # Return 0 if quaternion data is not available yet
+            return 0.0
 
     def image_callback(self, msg):
         bridge = CvBridge()
         try:
             cv_image = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             
-            # Process line detection
-            result_img, line_info = process_linreg(cv_image)
+            # Process line detection with current heading
+            result_img, line_info = process_linreg(cv_image, self.current_heading)
             
             # Publish result image
             ros_image_msg = bridge.cv2_to_imgmsg(result_img, encoding='bgr8')
