@@ -214,7 +214,11 @@ class LineFollowingVisualizer:
         """Draw information panel with all numeric data"""
         # Info panel background
         panel_height = 200
-        cv2.rectangle(img, (5, 5), (400, panel_height), self.colors['info_bg'], -1)
+        panel_width = 400
+        alpha = 0.3
+        overlay = img.copy()
+        cv2.rectangle(overlay, (5, 5), (panel_width, panel_height), self.colors['info_bg'], -1)
+        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
         
         y_offset = 25
         line_height = 25
