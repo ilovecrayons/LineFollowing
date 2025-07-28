@@ -41,13 +41,13 @@ class LineDetector(Node):
         # A subscriber to the topic '/aero_downward_camera/image'
         self.downward_camera_sub = self.create_subscription(
             Image,
-            '/downwardCamera/image_raw',
+            '/downwardCamera/downward_camera/image_raw',
             self.camera_sub_cb,
             10
         )
         self.forward_camera_sub = self.create_subscription(
             Image,
-            '/frontCamera/image_raw',
+            '/frontCamera/front_camera/image_raw',
             self.blank_cb,
             10
         )
