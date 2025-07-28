@@ -157,7 +157,6 @@ class LineDetector(Node):
         """
         # Convert Image msg to OpenCV image
         image = self.bridge.imgmsg_to_cv2(msg, "mono8")
-        image = cv2.rotate(image, cv2.ROTATE_180)
 
         # Crop the image to reduce FOV
         cropped_image = self.crop_center(image)
