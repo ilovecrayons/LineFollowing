@@ -194,7 +194,7 @@ class LineController(Node):
         self.offboard_setpoint_counter = 0
         self.vehicle_local_position = VehicleLocalPosition()
         self.vehicle_status = VehicleStatus()
-        self.takeoff_height = -3.0
+        self.takeoff_height = -1.5
 
         # Linear setpoint velocities in downward camera frame
         self.vx__dc = 0.0
