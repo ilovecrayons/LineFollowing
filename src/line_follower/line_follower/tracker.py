@@ -25,7 +25,7 @@ CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2]) # Center of the image frame
 EXTEND = 300 # Number of pixels forward to extrapolate the line
 KP_X = 0.03    # Increased for more responsive lateral control
 KP_Y = 0.03    # Increased for more responsive forward/backward control
-KP_Z_W = 5  # Reduced to prevent oscillation
+KP_Z_W = 7  # Reduced to prevent oscillation
 DISPLAY = True
 
 #########################
