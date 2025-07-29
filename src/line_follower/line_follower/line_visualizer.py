@@ -10,7 +10,7 @@ class LineFollowingVisualizer:
     All visualizations are drawn in camera frame coordinates.
     """
     
-    def __init__(self, image_width: int = 768, image_height: int = 576, extend_pixels: int = 300):
+    def __init__(self, image_width: int = 1280, image_height: int = 720, extend_pixels: int = 300):
         self.image_width = image_width
         self.image_height = image_height
         self.extend_pixels = extend_pixels
@@ -29,7 +29,7 @@ class LineFollowingVisualizer:
             'info_text': (255, 255, 255),      # White - text
             'target_path': (255, 255, 0),      # Yellow - path from center to target
         }
-    
+        
     def create_debug_visualization(self, 
                                  image: np.ndarray,
                                  line_params: Optional[Dict[str, float]] = None,

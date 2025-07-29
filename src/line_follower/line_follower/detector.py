@@ -27,7 +27,7 @@ LENGTH_THRESH = None  # If the length of the largest contour is less than LENGTH
 KERNEL = np.ones((5, 5), np.uint8)
 DISPLAY = True
 # Define FOV reduction factor (0.5 = 50% reduction)
-FOV_REDUCTION = 0.6
+FOV_REDUCTION = 1.0
 
 logger = logging_framework.Logger()
 class LineDetector(Node):

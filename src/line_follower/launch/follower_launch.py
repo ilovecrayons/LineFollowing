@@ -11,8 +11,8 @@ def generate_launch_description():
             {'camera': '/base/axi/pcie@120000/rp1/i2c@88000/imx708@1a'},
             {'frame_id': 'downward_camera_frame'},
             {'fps': 30.0},
-            {'width': 640},
-            {'height': 480}
+            {'width': 1280},
+            {'height': 720}
         ],
         output='screen'
     )
@@ -26,8 +26,8 @@ def generate_launch_description():
             {'camera': '/base/axi/pcie@120000/rp1/i2c@80000/imx708@1a'},
             {'frame_id': 'front_camera_frame'},
             {'fps': 30.0},
-            {'width': 640},
-            {'height': 480}
+            {'width': 1280},
+            {'height': 720}
         ],
         output='screen'
     )
