@@ -16,16 +16,16 @@ logger = logging_framework.Logger()
 # CONSTANTS #
 #############
 _RATE = 10 # (Hz) rate for rospy.rate
-_MAX_SPEED = 1.5 # (m/s)
-_MAX_CLIMB_RATE = 1.0 # m/s
+_MAX_SPEED = 1 # (m/s)
+_MAX_CLIMB_RATE = 0.5 # m/s
 _MAX_ROTATION_RATE = 5.0 # rad/s
 IMAGE_HEIGHT = 576  # Updated to match actual cropped image dimensions
 IMAGE_WIDTH = 768   # Updated to match actual cropped image dimensions
 CENTER = np.array([IMAGE_WIDTH//2, IMAGE_HEIGHT//2]) # Center of the image frame. We will treat this as the center of mass of the drone
-EXTEND = 300 # Number of pixels forward to extrapolate the line
-KP_X = 0.03    # Increased for more responsive lateral control
-KP_Y = 0.03    # Increased for more responsive forward/backward control
-KP_Z_W = 7  # Reduced to prevent oscillation
+EXTEND = 200 # Number of pixels forward to extrapolate the line
+KP_X = 0.003    # Increased for more responsive lateral control
+KP_Y = 0.003    # Increased for more responsive forward/backward control
+KP_Z_W = 5  # Reduced to prevent oscillation
 DISPLAY = True
 
 #########################
@@ -194,7 +194,7 @@ class LineController(Node):
         self.offboard_setpoint_counter = 0
         self.vehicle_local_position = VehicleLocalPosition()
         self.vehicle_status = VehicleStatus()
-        self.takeoff_height = -1.5
+        self.takeoff_height = -0.5
 
         # Linear setpoint velocities in downward camera frame
         self.vx__dc = 0.0
@@ -329,9 +329,9 @@ class LineController(Node):
         wz_bd = min(max(wz_bd, -_MAX_ROTATION_RATE), _MAX_ROTATION_RATE)
 
         # 5. Publish the final trajectory setpoint message.
-        # vx_ned = 0.0
-        # vy_ned = 0.0
-        # wz_bd = 0.0
+        #vx_ned = 0.0
+        #vy_ned = 0.3
+        #wz_bd = 3.0
         self.publish_trajectory_setpoint(vx_ned, vy_ned, wz_bd)
     
     def timer_callback(self) -> None:
