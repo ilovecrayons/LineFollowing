@@ -17,20 +17,20 @@ def generate_launch_description():
         output='screen'
     )
 
-    fc_node = Node(
-        package='camera_ros',
-        executable='camera_node',
-        name='front_camera',
-        namespace='frontCamera',
-        parameters=[
-            {'camera': '/base/axi/pcie@120000/rp1/i2c@80000/imx708@1a'},
-            {'frame_id': 'front_camera_frame'},
-            {'fps': 10.0},
-            {'width': 1280},
-            {'height': 720}
-        ],
-        output='screen'
-    )
+    # fc_node = Node(
+    #     package='camera_ros',
+    #     executable='camera_node',
+    #     name='front_camera',
+    #     namespace='frontCamera',
+    #     parameters=[
+    #         {'camera': '/base/axi/pcie@120000/rp1/i2c@80000/imx708@1a'},
+    #         {'frame_id': 'front_camera_frame'},
+    #         {'fps': 10.0},
+    #         {'width': 1280},
+    #         {'height': 720}
+    #     ],
+    #     output='screen'
+    # )
     
     
     follower_node = Node(
@@ -45,4 +45,4 @@ def generate_launch_description():
         output='screen'
     )
 
-    return LaunchDescription([dc_node, fc_node, follower_node, detector_node])
+    return LaunchDescription([dc_node, follower_node, detector_node])

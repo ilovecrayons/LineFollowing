@@ -10,7 +10,7 @@ import rclpy
 from rclpy.node import Node
 import cv2
 from std_msgs.msg import String
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from cv_bridge import CvBridge, CvBridgeError
 from line_interfaces.msg import Line
 import sys
@@ -40,8 +40,8 @@ class LineDetector(Node):
 
         # A subscriber to the topic '/aero_downward_camera/image'
         self.downward_camera_sub = self.create_subscription(
-            Image,
-            '/downwardCamera/downward_camera/image_raw',
+            CompressedImage,
+            '/downwardCamera/downward_camera/image_raw/compressed',
             self.camera_sub_cb,
             10
         )
@@ -156,7 +156,8 @@ class LineDetector(Node):
                 - msg = ROS Image message
         """
         # Convert Image msg to OpenCV image
-        image = self.bridge.imgmsg_to_cv2(msg, "mono8")
+        np_arr = np.frombuffer(msg.data, np.uint8)
+        image = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
 
         # Crop the image to reduce FOV
         cropped_image = self.crop_center(image)
